@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>关系导入 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>关系导入</h1>
+            <p class="desc">批量导入好友关系（边）。系统按用户分片存储，增量导入只触达受影响的分片，随后自动维护索引。</p>
+          </div>
+          <div class="actions">
+            <button class="btn" id="btnSample">填充示例</button>
+            <button class="btn btn-primary" id="btnImport">⇄ 导入关系</button>
+          </div>
+        </div>
+
+        <div class="grid cols-3">
+          <div class="card" style="grid-column: span 2">
+            <div class="card-title">边列表</div>
+            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔。</p>
+            <textarea class="textarea mt-8" id="edgeInput" rows="12" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5"></textarea>
+          </div>
+          <div class="card">
+            <div class="card-title">导入结果</div>
+            <div id="importResult" class="mt-8 small muted">尚未导入。</div>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+            <div class="card-title" style="font-size:13px">生成随机关系</div>
+            <div class="field-group mt-8">
+              <label class="field">用户数</label>
+              <input class="input" id="genNodes" type="number" value="50">
+            </div>
+            <div class="field-group">
+              <label class="field">平均度数</label>
+              <input class="input" id="genDeg" type="number" value="8">
+            </div>
+            <button class="btn" id="btnGenerate" style="width:100%">生成并填充</button>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+            <button class="btn btn-primary" id="btnSeed" style="width:100%">生成完整演示数据</button>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">最近导入记录</div>
+            <button class="btn btn-sm" id="btnReloadLog">刷新</button>
+          </div>
+          <div id="importLog" class="small"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function parseEdges(text) {
+      const edges = [];
+      const lines = text.split(/\r?\n/);
+      for (const line of lines) {
+        const t = line.trim();
+        if (!t || t.startsWith("#")) continue;
+        const parts = t.split(/[\s,;\t]+/).filter(Boolean);
+        if (parts.length < 2) continue;
+        const u = parseInt(parts[0], 10);
+        const v = parseInt(parts[1], 10);
+        if (isNaN(u) || isNaN(v)) continue;
+        let w = 1.0;
+        if (parts.length >= 3 && !isNaN(parseFloat(parts[2]))) w = parseFloat(parts[2]);
+        edges.push([u, v, w]);
+      }
+      return edges;
+    }
+
+    function doImport(edges, source) {
+      if (!edges.length) { C.toast("没有可导入的边", "warning"); return; }
+      const btn = document.getElementById("btnImport");
+      btn.disabled = true; btn.textContent = "导入中…";
+      api.importEdges(edges, source)
+        .then((r) => {
+          const box = document.getElementById("importResult");
+          box.innerHTML =
+            '<div class="badge success">成功</div>' +
+            '<div class="mt-8">导入 <strong>' + r.imported + "</strong> 条边</div>" +
+            '<div class="mt-8">跳过重复 <strong>' + r.skipped + "</strong> 条</div>" +
+            '<div class="mt-8">自环忽略 <strong>' + r.self_loops + "</strong> 条</div>" +
+            '<div class="mt-8">触达分片 <strong>' + r.touched_shards + "</strong> 个</div>";
+          C.toast("已导入 " + r.imported + " 条关系", "success");
+          loadLog();
+        })
+        .catch((e) => C.toast(e.message, "error"))
+        .finally(() => { btn.disabled = false; btn.textContent = "⇄ 导入关系"; });
+    }
+
+    function loadLog() {
+      const box = document.getElementById("importLog");
+      // 后端不直接提供日志读取，这里用 stats 的 shard 信息给出概览。
+      api.stats().then((s) => {
+        const shards = s.shards || [];
+        const totalEdges = shards.reduce((a, b) => a + b.edges, 0);
+        const totalUsers = shards.reduce((a, b) => a + b.users, 0);
+        box.innerHTML =
+          '<div class="row wrap">' +
+          '<span class="badge info">分片 ' + shards.length + "</span>" +
+          '<span class="badge brand">边 ' + totalEdges + "</span>" +
+          '<span class="badge">节点 ' + s.graph.nodes + "</span>" +
+          "</div>";
+      }).catch(() => { box.innerHTML = '<span class="faint">加载失败</span>'; });
+    }
+
+    function fillSample() {
+      const n = 30, deg = 6;
+      const lines = [];
+      const rng = mulberry(42);
+      for (let i = 1; i <= n; i++) {
+        for (let k = 0; k < deg; k++) {
+          const j = 1 + Math.floor(rng() * n);
+          if (j !== i) lines.push(i + " " + j);
+        }
+      }
+      document.getElementById("edgeInput").value = lines.join("\n");
+    }
+
+    function generateRandom() {
+      const n = parseInt(document.getElementById("genNodes").value, 10) || 50;
+      const deg = parseInt(document.getElementById("genDeg").value, 10) || 8;
+      const lines = [];
+      const rng = mulberry(Date.now() % 100000);
+      for (let i = 1; i <= n; i++) {
+        for (let k = 0; k < deg; k++) {
+          const j = 1 + Math.floor(rng() * n);
+          if (j !== i) lines.push(i + " " + j + " " + (0.5 + rng() * 0.5).toFixed(2));
+        }
+      }
+      document.getElementById("edgeInput").value = lines.join("\n");
+      C.toast("已生成 " + lines.length + " 条随机边", "success");
+    }
+
+    // 确定性伪随机数（Mulberry32）
+    function mulberry(seed) {
+      let a = seed >>> 0;
+      return function () {
+        a |= 0; a = (a + 0x6D2B79F5) | 0;
+        let t = Math.imul(a ^ (a >>> 15), 1 | a);
+        t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+      };
+    }
+
+    C.initPage("import", function () {
+      document.getElementById("btnImport").addEventListener("click", () => {
+        doImport(parseEdges(document.getElementById("edgeInput").value), "manual");
+      });
+      document.getElementById("btnSample").addEventListener("click", fillSample);
+      document.getElementById("btnGenerate").addEventListener("click", generateRandom);
+      document.getElementById("btnReloadLog").addEventListener("click", loadLog);
+      document.getElementById("btnSeed").addEventListener("click", () => {
+        const btn = document.getElementById("btnSeed");
+        btn.disabled = true; btn.textContent = "生成中…";
+        api.seed({}).then((r) => {
+          C.toast("演示数据已生成：" + r.users + " 用户 / " + r.edges + " 边", "success");
+          loadLog();
+        }).catch((e) => C.toast(e.message, "error"))
+          .finally(() => { btn.disabled = false; btn.textContent = "生成完整演示数据"; });
+      });
+      fillSample();
+      loadLog();
+    });
+  </script>
+</body>
+</html>

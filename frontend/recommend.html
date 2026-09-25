@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>个性化推荐 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>个性化推荐</h1>
+            <p class="desc">融合协同过滤、图嵌入与标签信号，经 MMR 多样性重排序；冷启动用户自动退化为热门 + 标签推荐。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row wrap">
+            <div class="field-group" style="flex:1;min-width:150px;margin-bottom:0">
+              <label class="field">目标用户 ID</label>
+              <input class="input" id="uid" type="number" placeholder="如 1">
+            </div>
+            <div class="field-group" style="flex:1;min-width:120px;margin-bottom:0">
+              <label class="field">推荐数量 K</label>
+              <input class="input" id="k" type="number" value="10" min="1" max="50">
+            </div>
+            <div class="field-group" style="min-width:170px;margin-bottom:0">
+              <label class="field">推荐策略</label>
+              <select class="select" id="strategy">
+                <option value="hybrid">混合（默认）</option>
+                <option value="cf">协同过滤</option>
+                <option value="embedding">图嵌入</option>
+                <option value="popularity">热门基线</option>
+              </select>
+            </div>
+            <div class="field-group" style="margin-bottom:0;align-self:flex-end">
+              <button class="btn btn-primary btn-lg" id="btnRec">生成推荐</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">推荐结果</div>
+            <div class="row" id="recBadges"></div>
+          </div>
+          <div id="recList"></div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">批量推荐</div>
+            <span class="sub">为多个用户一次性生成推荐</span>
+          </div>
+          <div class="row wrap">
+            <input class="input" id="batchIds" placeholder="多个 ID，逗号分隔，如 1,2,3" style="flex:1;min-width:240px">
+            <button class="btn" id="btnBatch">批量生成</button>
+          </div>
+          <div id="batchResult" class="mt-16"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function reasonBadge(reason) {
+      const map = { "协同过滤": "brand", "图嵌入": "info", "标签": "success", "热门": "warning" };
+      return '<span class="badge ' + (map[reason] || "") + '">' + reason + "</span>";
+    }
+
+    function renderRec(r) {
+      const badges = document.getElementById("recBadges");
+      badges.innerHTML =
+        '<span class="badge brand">策略 ' + r.strategy + "</span>" +
+        (r.cold_start ? '<span class="badge warning">❄ 冷启动</span>' : '<span class="badge success">正常</span>') +
+        '<span class="badge">好友数 ' + r.degree + "</span>" +
+        '<span class="badge info">多样性 λ=' + r.diversity + "</span>" +
+        (r.cached ? '<span class="badge">缓存命中</span>' : '<span class="badge success">实时计算 ' + r.time_ms.toFixed(1) + " ms</span>");
+
+      const box = document.getElementById("recList");
+      if (!r.items.length) { box.innerHTML = C.emptyState("✦", "无可推荐对象（图可能太小或该用户已与所有人相连）"); return; }
+      box.innerHTML = r.items.map((it, i) =>
+        '<div class="rec-item">' +
+        '<div class="rec-rank' + (i < 3 ? " top" : "") + '">' + (i + 1) + "</div>" +
+        '<div class="rec-info"><div class="name">' + C.escapeHtml(it.name || ("用户 " + it.id)) + ' <span class="faint mono small">#' + it.id + "</span></div>" +
+        '<div class="meta">' + reasonBadge(it.reason) + "</div></div>" +
+        '<div class="rec-score">' + it.score.toFixed(4) + "</div>" +
+        "</div>"
+      ).join("");
+    }
+
+    function recommend(uid, k, strategy) {
+      const box = document.getElementById("recList");
+      box.innerHTML = C.spinner();
+      api.recommend(uid, { k, strategy, refresh: true }).then(renderRec)
+        .catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
+    }
+
+    C.initPage("recommend", function () {
+      document.getElementById("btnRec").addEventListener("click", () => {
+        const uid = parseInt(document.getElementById("uid").value, 10);
+        const k = parseInt(document.getElementById("k").value, 10) || 10;
+        const strategy = document.getElementById("strategy").value;
+        if (isNaN(uid)) { C.toast("请输入目标用户 ID", "warning"); return; }
+        recommend(uid, k, strategy);
+      });
+      document.getElementById("uid").addEventListener("keyup", (e) => { if (e.key === "Enter") document.getElementById("btnRec").click(); });
+
+      document.getElementById("btnBatch").addEventListener("click", () => {
+        const ids = document.getElementById("batchIds").value.split(/[\s,，]+/).map((s) => parseInt(s, 10)).filter((n) => !isNaN(n));
+        if (!ids.length) { C.toast("请输入有效的用户 ID 列表", "warning"); return; }
+        const box = document.getElementById("batchResult");
+        box.innerHTML = C.spinner();
+        api.recommendMany(ids, 5).then((d) => {
+          const results = d.results || {};
+          let html = "";
+          for (const uid of ids) {
+            const items = results[String(uid)] || [];
+            html += '<div class="card" style="margin-bottom:10px;padding:14px"><strong>用户 ' + uid + "</strong>" +
+                    (items.length ? items.map((it) => '<span class="badge brand" style="margin-left:6px">' + (it.name || it.id) + "</span>").join("") : ' <span class="faint">无</span>') +
+                    "</div>";
+          }
+          box.innerHTML = html;
+        }).catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
+      });
+
+      document.getElementById("uid").value = 1;
+      recommend(1, 10, "hybrid");
+    });
+  </script>
+</body>
+</html>

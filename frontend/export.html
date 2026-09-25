@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>数据导出 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>数据导出</h1>
+            <p class="desc">将图数据导出为 JSON、GraphML 或 CSV 格式，便于在 Gephi、Pandas 等工具中继续分析。</p>
+          </div>
+        </div>
+
+        <div class="grid cols-3">
+          <div class="card">
+            <div class="card-title">JSON</div>
+            <p class="small muted mt-8">完整节点 + 边 + 社群归属，适合程序化处理。</p>
+            <button class="btn btn-primary mt-16" data-fmt="json">导出 JSON</button>
+          </div>
+          <div class="card">
+            <div class="card-title">GraphML</div>
+            <p class="small muted mt-8">标准图交换格式，可直接导入 Gephi / yEd。</p>
+            <button class="btn btn-primary mt-16" data-fmt="graphml">导出 GraphML</button>
+          </div>
+          <div class="card">
+            <div class="card-title">CSV</div>
+            <p class="small muted mt-8">边列表（from,to,weight），适合 Excel / Pandas。</p>
+            <button class="btn btn-primary mt-16" data-fmt="csv">导出 CSV</button>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">导出预览</div>
+          </div>
+          <pre id="preview" class="small" style="max-height:420px;overflow:auto;background:var(--bg-inset);border-radius:8px;padding:14px;font-family:var(--mono);font-size:12px">点击上方按钮导出并预览。</pre>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-title">存储维护</div>
+          <p class="small muted mt-8">大规模增量更新后，分片可能累积重复项、索引漂移。以下操作会合并分片、去重并重建索引。</p>
+          <div class="row wrap mt-16">
+            <button class="btn" id="btnRebuild">重建索引</button>
+            <button class="btn" id="btnMerge">合并分片</button>
+          </div>
+          <div id="maintResult" class="small muted mt-16"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function download(filename, text) {
+      const blob = new Blob([text], { type: "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename;
+      document.body.appendChild(a); a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
+    function doExport(fmt) {
+      const box = document.getElementById("preview");
+      box.textContent = "导出中…";
+      api.export(fmt).then((res) => {
+        if (res._download) {
+          download(res.filename, res.text);
+          // 预览：JSON 美化，其余展示前若干行。
+          if (fmt === "json") {
+            try { box.textContent = JSON.stringify(JSON.parse(res.text), null, 2).slice(0, 4000); }
+            catch (_) { box.textContent = res.text.slice(0, 4000); }
+          } else {
+            box.textContent = res.text.slice(0, 4000);
+          }
+          C.toast("已导出 " + res.filename, "success");
+        } else {
+          box.textContent = JSON.stringify(res, null, 2).slice(0, 4000);
+        }
+      }).catch((e) => { box.textContent = "导出失败：" + e.message; });
+    }
+
+    C.initPage("export", function () {
+      document.querySelectorAll("[data-fmt]").forEach((btn) => {
+        btn.addEventListener("click", () => doExport(btn.dataset.fmt));
+      });
+      document.getElementById("btnRebuild").addEventListener("click", () => {
+        const box = document.getElementById("maintResult");
+        box.textContent = "重建索引中…";
+        api.rebuildIndex().then((r) => {
+          box.innerHTML = '<span class="badge success">完成</span> 节点 ' + r.node_count + "，边 " + r.edge_count;
+          C.toast("索引已重建", "success");
+        }).catch((e) => { box.textContent = "失败：" + e.message; });
+      });
+      document.getElementById("btnMerge").addEventListener("click", () => {
+        const box = document.getElementById("maintResult");
+        box.textContent = "合并分片中…";
+        api.mergeShards().then((r) => {
+          box.innerHTML = '<span class="badge success">完成</span> 合并 ' + r.shards + " 个分片，去重 " + r.removed_duplicates + " 条";
+          C.toast("分片已合并", "success");
+        }).catch((e) => { box.textContent = "失败：" + e.message; });
+      });
+    });
+  </script>
+</body>
+</html>

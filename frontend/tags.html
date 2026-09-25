@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>标签管理 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>标签管理</h1>
+            <p class="desc">维护画像标签体系。标签是推荐冷启动与混合策略的重要信号。</p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" id="btnAdd">＋ 新增标签</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head">
+            <div class="card-title">标签列表</div>
+            <span class="badge" id="tagCount"></span>
+          </div>
+          <div id="tagGrid" class="grid cols-3"></div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">标签使用说明</div>
+          </div>
+          <div class="small muted">
+            标签用于两类场景：
+            <ul class="mt-8" style="margin-left:18px;padding-left:0">
+              <li><strong>推荐冷启动</strong>：当用户好友数低于阈值（默认 3）时，系统退化为「标签重叠 + 热门」推荐。</li>
+              <li><strong>混合策略</strong>：在协同过滤与图嵌入之外，叠加标签相似度信号，提升多样性。</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function load() {
+      api.tags().then((d) => {
+        const tags = d.tags || [];
+        document.getElementById("tagCount").textContent = tags.length + " 个标签";
+        const grid = document.getElementById("tagGrid");
+        if (!tags.length) { grid.innerHTML = C.emptyState("🏷", "暂无标签，点击右上角新增"); return; }
+        grid.innerHTML = tags.map((t, i) =>
+          '<div class="card" style="padding:16px">' +
+          '<div class="row spread">' +
+          '<span class="tag" style="background:' + C.colorFor(i) + '1a;color:' + C.colorFor(i) + '"><span class="dot"></span>' + C.escapeHtml(t.name) + "</span>" +
+          '<button class="btn btn-sm btn-danger" onclick="delTag(\'' + C.escapeHtml(t.name).replace(/'/g, "\\'") + '\')">删除</button>' +
+          "</div>" +
+          '<div class="small muted mt-8">使用人数：<strong>' + (t.count || 0) + "</strong></div>" +
+          "</div>"
+        ).join("");
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    async function addTag() {
+      const idx = await C.modal("新增标签",
+        '<div class="field-group"><label class="field">标签名称</label><input class="input" id="tName" placeholder="如：科技、音乐…"></div>' +
+        '<div class="field-group"><label class="field">颜色（可选）</label><input class="input" id="tColor" type="color" value="#4f8cff"></div>',
+        [{ label: "取消", cls: "btn-ghost" }, { label: "创建", cls: "btn-primary" }]);
+      if (idx !== 1) return;
+      const name = document.getElementById("tName").value.trim();
+      const color = document.getElementById("tColor").value;
+      if (!name) { C.toast("标签名称不能为空", "warning"); return; }
+      try {
+        await api.addTag(name, color);
+        C.toast("已创建标签 " + name, "success");
+        load();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    async function delTag(name) {
+      const ok = await C.confirmDialog("删除标签「" + name + "」？将从所有用户画像中移除该标签。");
+      if (!ok) return;
+      try {
+        await api.deleteTag(name);
+        C.toast("已删除标签 " + name, "success");
+        load();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    window.delTag = delTag;
+
+    C.initPage("tags", function () {
+      document.getElementById("btnAdd").addEventListener("click", addTag);
+      load();
+    });
+  </script>
+</body>
+</html>

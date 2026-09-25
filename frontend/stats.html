@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>统计面板 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>统计面板</h1>
+            <p class="desc">图结构指标、度数分布、社群与 PageRank 中心性、分片存储占用总览。</p>
+          </div>
+          <button class="btn" id="btnRefresh">刷新</button>
+        </div>
+
+        <div class="grid cols-4" id="tiles"></div>
+
+        <div class="grid cols-2 mt-16">
+          <div class="card">
+            <div class="card-title">度数分布</div>
+            <div id="degreeDist" class="card-body" style="max-height:420px;overflow-y:auto"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">PageRank 中心性 Top</div>
+            <div id="pagerank" class="card-body" style="max-height:420px;overflow-y:auto"></div>
+          </div>
+        </div>
+
+        <div class="grid cols-2 mt-16">
+          <div class="card">
+            <div class="card-title">社群规模</div>
+            <div id="communitySizes" class="card-body"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">分片存储</div>
+            <div id="shards" class="card-body" style="max-height:420px;overflow-y:auto"></div>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function renderTiles(s) {
+      const g = s.graph || {};
+      const tiles = [
+        { label: "节点数", value: C.fmt(g.nodes), hint: "用户总数" },
+        { label: "边数", value: C.fmt(g.edges), hint: "好友关系" },
+        { label: "平均度数", value: C.fmt(g.avg_degree), hint: "密度 " + C.fmtPct(g.density) },
+        { label: "连通分量", value: C.fmt(g.components), hint: "孤立节点 " + C.fmt(g.isolated) },
+        { label: "社群数", value: C.fmt(s.communities), hint: "模块度 " + (s.modularity != null ? s.modularity.toFixed(4) : "—") },
+        { label: "标签数", value: C.fmt(s.tags), hint: "画像标签体系" },
+        { label: "用户 / 画像", value: C.fmt(s.users) + " / " + C.fmt(s.profiles), hint: "档案与派生画像分开存储" },
+        { label: "缓存推荐", value: C.fmt(s.recommendations_cached), hint: "内存缓存命中" },
+      ];
+      document.getElementById("tiles").innerHTML = tiles.map((t) =>
+        '<div class="card stat-tile"><div class="label">' + t.label + '</div><div class="value">' + t.value + '</div><div class="hint">' + t.hint + "</div></div>"
+      ).join("");
+    }
+
+    function renderDegreeDist(dd) {
+      if (!dd || !dd.length) { document.getElementById("degreeDist").innerHTML = C.emptyState("📊", "无数据"); return; }
+      const max = Math.max.apply(null, dd.map((d) => d.count));
+      document.getElementById("degreeDist").innerHTML = dd.map((d) =>
+        '<div class="bar-row"><span class="bar-label">度数 ' + d.degree + "</span>" +
+        '<span class="bar-track"><span class="bar-fill" style="width:' + (d.count / max * 100).toFixed(1) + '%"></span></span>' +
+        '<span class="bar-val">' + d.count + "</span></div>"
+      ).join("");
+    }
+
+    function renderPagerank(pr) {
+      const top = pr.top || [];
+      if (!top.length) { document.getElementById("pagerank").innerHTML = C.emptyState("⭐", "暂无数据"); return; }
+      const max = top[0].score;
+      document.getElementById("pagerank").innerHTML = top.map((t, i) =>
+        '<div class="bar-row"><span class="bar-label">' + t.name + "</span>" +
+        '<span class="bar-track"><span class="bar-fill" style="width:' + (t.score / max * 100).toFixed(1) + "%;background:" + C.colorFor(i) + '"></span></span>' +
+        '<span class="bar-val">' + t.score.toFixed(5) + "</span></div>"
+      ).join("");
+    }
+
+    function renderCommunitySizes(s) {
+      const box = document.getElementById("communitySizes");
+      box.innerHTML =
+        '<div class="row spread mb-8"><span class="muted">社群数</span><strong>' + s.communities + "</strong></div>" +
+        '<div class="row spread"><span class="muted">模块度 Q</span><strong>' + (s.modularity != null ? s.modularity.toFixed(4) : "—") + "</strong></div>";
+    }
+
+    function renderShards(shards) {
+      const box = document.getElementById("shards");
+      if (!shards || !shards.length) { box.innerHTML = C.emptyState("💾", "无分片数据"); return; }
+      const totalEdges = shards.reduce((a, b) => a + b.edges, 0);
+      const totalSize = shards.reduce((a, b) => a + b.size_bytes, 0);
+      let html = '<div class="row wrap mb-8"><span class="badge info">' + shards.length + ' 分片</span>' +
+                 '<span class="badge brand">' + totalEdges + ' 边</span>' +
+                 '<span class="badge">' + (totalSize / 1024).toFixed(1) + " KB</span></div>";
+      const maxEdges = Math.max.apply(null, shards.map((s) => s.edges).concat([1]));
+      html += shards.map((s) =>
+        '<div class="bar-row"><span class="bar-label mono">shard ' + String(s.shard).padStart(2, "0") + "</span>" +
+        '<span class="bar-track"><span class="bar-fill" style="width:' + (s.edges / maxEdges * 100).toFixed(1) + "%;background:" + C.colorFor(s.shard) + '"></span></span>' +
+        '<span class="bar-val">' + s.edges + " 边</span></div>"
+      ).join("");
+      box.innerHTML = html;
+    }
+
+    function load() {
+      const p1 = api.stats();
+      const p2 = api.pagerank({ top: 15 });
+      Promise.all([p1, p2]).then(([s, pr]) => {
+        renderTiles(s);
+        renderDegreeDist(s.graph.degree_distribution);
+        renderPagerank(pr);
+        renderCommunitySizes(s);
+        renderShards(s.shards);
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    C.initPage("stats", function () {
+      document.getElementById("btnRefresh").addEventListener("click", load);
+      load();
+    });
+  </script>
+</body>
+</html>

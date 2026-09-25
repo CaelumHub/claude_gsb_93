@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>用户管理 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>用户管理</h1>
+            <p class="desc">管理用户档案与画像。标签用于推荐冷启动，属性可扩展任意字段。</p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-primary" id="btnNew">＋ 新建用户</button>
+            <button class="btn" id="btnRefresh">刷新</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row wrap">
+            <div class="input-group" style="flex:1;min-width:220px">
+              <input class="input" id="search" placeholder="搜索姓名或 ID…">
+              <select class="select" id="tagFilter" style="max-width:150px">
+                <option value="">全部标签</option>
+              </select>
+            </div>
+            <button class="btn" id="btnSearch">搜索</button>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">用户列表 <span class="sub" id="totalInfo"></span></div>
+          </div>
+          <div id="userTable"></div>
+          <div class="pagination" id="pager"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+    let state = { page: 1, size: 12, total: 0, search: "", tag: "" };
+
+    function loadTags() {
+      api.tags().then((d) => {
+        const sel = document.getElementById("tagFilter");
+        const cur = sel.value;
+        sel.innerHTML = '<option value="">全部标签</option>';
+        (d.tags || []).forEach((t) => {
+          const o = document.createElement("option");
+          o.value = t.name; o.textContent = t.name + " (" + t.count + ")";
+          sel.appendChild(o);
+        });
+        sel.value = cur;
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    function loadUsers() {
+      const box = document.getElementById("userTable");
+      box.innerHTML = C.spinner();
+      api.listUsers({ page: state.page, size: state.size, search: state.search, tag: state.tag })
+        .then((d) => {
+          state.total = d.total;
+          document.getElementById("totalInfo").textContent = "共 " + d.total + " 人";
+          C.renderTable(box, [
+            { key: "id", label: "ID", align: "right", render: (r) => '<span class="mono">' + r.id + "</span>" },
+            { key: "name", label: "姓名", render: (r) => "<strong>" + C.escapeHtml(r.name) + "</strong>" },
+            { key: "tags", label: "标签", render: (r) => (r.tags || []).map((t) => '<span class="tag">' + C.escapeHtml(t) + "</span>").join(" ") || '<span class="faint">—</span>' },
+            { key: "degree", label: "好友数", align: "right", render: (r) => '<span class="mono">' + (r.degree != null ? r.degree : "—") + "</span>" },
+            { key: "city", label: "城市", render: (r) => C.escapeHtml((r.attributes || {}).city || "—") },
+            { key: "actions", label: "操作", render: (r) =>
+              '<button class="btn btn-sm" onclick="editUser(' + r.id + ')">编辑</button> ' +
+              '<button class="btn btn-sm btn-ghost" onclick="viewUser(' + r.id + ')">详情</button> ' +
+              '<button class="btn btn-sm btn-danger" onclick="delUser(' + r.id + ')">删除</button>' },
+          ], d.items);
+          renderPager();
+        })
+        .catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
+    }
+
+    function renderPager() {
+      const totalPages = Math.max(1, Math.ceil(state.total / state.size));
+      const p = document.getElementById("pager");
+      p.innerHTML =
+        '<span class="page-info">第 ' + state.page + " / " + totalPages + " 页</span>" +
+        '<button class="btn btn-sm" ' + (state.page <= 1 ? "disabled" : "") + ' onclick="goPage(' + (state.page - 1) + ')">上一页</button>' +
+        '<button class="btn btn-sm" ' + (state.page >= totalPages ? "disabled" : "") + ' onclick="goPage(' + (state.page + 1) + ')">下一页</button>';
+    }
+
+    window.goPage = (p) => { state.page = p; loadUsers(); };
+
+    async function editUser(id) {
+      let u = null;
+      try { u = await api.getUser(id); } catch (e) { C.toast(e.message, "error"); return; }
+      const tags = await api.tags().catch(() => ({ tags: [] }));
+      const tagOpts = tags.tags.map((t) =>
+        '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '" ' +
+        ((u.tags || []).includes(t.name) ? "checked" : "") + '> ' + C.escapeHtml(t.name) + "</label>"
+      ).join("");
+      const body =
+        '<div class="field-group"><label class="field">姓名</label><input class="input" id="mName" value="' + C.escapeHtml(u.name) + '"></div>' +
+        '<div class="field-group"><label class="field">城市</label><input class="input" id="mCity" value="' + C.escapeHtml((u.attributes || {}).city || "") + '"></div>' +
+        '<div class="field-group"><label class="field">年龄</label><input class="input" id="mAge" type="number" value="' + ((u.attributes || {}).age || "") + '"></div>' +
+        '<div class="field-group"><label class="field">标签</label><div>' + tagOpts + "</div></div>";
+      const idx = await C.modal("编辑用户 #" + id, body, [
+        { label: "取消", cls: "btn-ghost" }, { label: "保存", cls: "btn-primary" },
+      ]);
+      if (idx !== 1) return;
+      const name = document.getElementById("mName").value.trim();
+      const city = document.getElementById("mCity").value.trim();
+      const age = parseInt(document.getElementById("mAge").value, 10) || 0;
+      const selectedTags = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+      try {
+        await api.updateUser(id, {
+          name, tags: selectedTags, attributes: { city, age },
+        });
+        C.toast("已保存用户 #" + id, "success");
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    async function viewUser(id) {
+      try {
+        const u = await api.getUser(id);
+        const attrs = Object.entries(u.attributes || {}).map(([k, v]) => "<div class='small muted'>" + k + ": <strong>" + C.escapeHtml(v) + "</strong></div>").join("") || '<div class="faint">无</div>';
+        const nbs = (u.neighbors || []).slice(0, 20).map((n) => '<span class="badge brand">' + n + "</span>").join(" ") || "—";
+        const body =
+          '<div class="row spread"><strong>ID</strong><span class="mono">' + u.id + "</span></div>" +
+          '<div class="row spread mt-8"><strong>姓名</strong><span>' + C.escapeHtml(u.name) + "</span></div>" +
+          '<div class="row spread mt-8"><strong>好友数</strong><span>' + u.degree + "</span></div>" +
+          '<div class="row spread mt-8"><strong>标签</strong><span>' + (u.tags || []).map((t) => '<span class="tag">' + C.escapeHtml(t) + "</span>").join(" ") + "</span></div>" +
+          '<div class="mt-8"><strong>属性</strong><div class="mt-8">' + attrs + "</div></div>" +
+          '<div class="mt-8"><strong>邻居（前 20）</strong><div class="mt-8 row wrap">' + nbs + "</div></div>";
+        await C.modal("用户详情 #" + id, body, [{ label: "关闭", cls: "btn-primary" }]);
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    window.viewUser = viewUser;
+    window.editUser = editUser;
+
+    async function delUser(id) {
+      const ok = await C.confirmDialog("确定删除用户 #" + id + " 及其所有关系边？此操作不可撤销。");
+      if (!ok) return;
+      try {
+        await api.deleteUser(id);
+        C.toast("已删除用户 #" + id, "success");
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+    window.delUser = delUser;
+
+    async function newUser() {
+      const tags = await api.tags().catch(() => ({ tags: [] }));
+      const tagOpts = tags.tags.map((t) =>
+        '<label class="row" style="padding:2px 0"><input type="checkbox" value="' + C.escapeHtml(t.name) + '"> ' + C.escapeHtml(t.name) + "</label>"
+      ).join("");
+      const body =
+        '<div class="field-group"><label class="field">姓名</label><input class="input" id="mName"></div>' +
+        '<div class="field-group"><label class="field">城市</label><input class="input" id="mCity"></div>' +
+        '<div class="field-group"><label class="field">年龄</label><input class="input" id="mAge" type="number"></div>' +
+        '<div class="field-group"><label class="field">标签</label><div>' + tagOpts + "</div></div>";
+      const idx = await C.modal("新建用户", body, [
+        { label: "取消", cls: "btn-ghost" }, { label: "创建", cls: "btn-primary" },
+      ]);
+      if (idx !== 1) return;
+      const name = document.getElementById("mName").value.trim();
+      if (!name) { C.toast("姓名不能为空", "warning"); return; }
+      const city = document.getElementById("mCity").value.trim();
+      const age = parseInt(document.getElementById("mAge").value, 10) || 0;
+      const selectedTags = Array.from(document.querySelectorAll('input[type="checkbox"]:checked')).map((c) => c.value);
+      try {
+        const u = await api.createUser({ name, tags: selectedTags, attributes: { city, age } });
+        C.toast("已创建用户 #" + u.id, "success");
+        loadUsers();
+      } catch (e) { C.toast(e.message, "error"); }
+    }
+
+    C.initPage("users", function () {
+      document.getElementById("btnNew").addEventListener("click", newUser);
+      document.getElementById("btnRefresh").addEventListener("click", loadUsers);
+      document.getElementById("btnSearch").addEventListener("click", () => {
+        state.search = document.getElementById("search").value.trim();
+        state.tag = document.getElementById("tagFilter").value;
+        state.page = 1;
+        loadUsers();
+      });
+      document.getElementById("search").addEventListener("keyup", (e) => { if (e.key === "Enter") document.getElementById("btnSearch").click(); });
+      loadTags();
+      loadUsers();
+    });
+  </script>
+</body>
+</html>

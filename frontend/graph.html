@@ -1,0 +1,269 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>图可视化 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>图可视化</h1>
+            <p class="desc">vis.js 交互式网络图：滚轮缩放、拖拽平移、节点点击查看邻居、路径高亮、社群着色。</p>
+          </div>
+          <div class="actions">
+            <button class="btn" id="btnFull">全图</button>
+            <button class="btn" id="btnFit">适应视图</button>
+            <button class="btn" id="btnPhysics">物理引擎</button>
+            <button class="btn btn-primary" id="btnReload">重新加载</button>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row wrap mb-16">
+            <div class="input-group" style="flex:1;min-width:260px">
+              <input class="input" id="focusNode" type="number" placeholder="按 ID 聚焦节点…">
+              <select class="select" id="focusDepth" style="max-width:130px">
+                <option value="1">1 跳邻居</option>
+                <option value="2" selected>2 跳邻居</option>
+                <option value="3">3 跳邻居</option>
+              </select>
+              <button class="btn" id="btnFocus">聚焦</button>
+            </div>
+            <div class="input-group" style="max-width:340px">
+              <input class="input" id="pathSrc" type="number" placeholder="起点 ID">
+              <input class="input" id="pathDst" type="number" placeholder="终点 ID">
+              <button class="btn btn-primary" id="btnPath">高亮路径</button>
+              <button class="btn btn-ghost" id="btnClearPath">清除</button>
+            </div>
+          </div>
+
+          <div class="graph-canvas-wrap">
+            <div id="network"></div>
+            <div class="graph-toolbar">
+              <button class="btn btn-sm" id="btnZoomIn" title="放大">＋</button>
+              <button class="btn btn-sm" id="btnZoomOut" title="缩小">－</button>
+            </div>
+            <div class="graph-legend" id="legend"></div>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">选中节点信息</div>
+          </div>
+          <div id="nodeInfo" class="small muted">点击画布中的节点查看详情。</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+    let network = null;
+    let nodesData = null;
+    let edgesData = null;
+    let currentNodes = [];   // {id,label,degree,community}
+    let currentEdges = [];   // {from,to,weight}
+    let communityMap = {};   // community -> {label,color}
+    let mode = "full";
+    let physicsOn = true;
+
+    const OPTIONS = {
+      nodes: {
+        shape: "dot",
+        size: 14,
+        borderWidth: 1.5,
+        font: { size: 12, color: "#5d6b82", face: "PingFang SC, Microsoft YaHei, sans-serif" },
+        shadow: false,
+      },
+      edges: {
+        color: { color: "#c8d2e0", highlight: "#4f8cff", opacity: 0.6 },
+        width: 1,
+        smooth: { enabled: true, type: "continuous", roundness: 0.5 },
+        hoverWidth: 2,
+      },
+      physics: {
+        enabled: true,
+        stabilization: { iterations: 200, updateInterval: 25 },
+        barnesHut: { gravitationalConstant: -3000, springLength: 95, springConstant: 0.04, damping: 0.3 },
+      },
+      interaction: {
+        hover: true,
+        tooltipDelay: 150,
+        zoomView: true,
+        dragView: true,
+        navigationButtons: false,
+        keyboard: true,
+      },
+      layout: { improvedLayout: true },
+    };
+
+    function colorOf(comm) {
+      if (comm == null || comm < 0) return "#9aa7bd";
+      return C.colorFor(comm);
+    }
+
+    function buildGraphData(nodes, edges) {
+      const nodeArr = nodes.map((n) => {
+        const c = colorOf(n.community);
+        return {
+          id: n.id,
+          label: n.label || String(n.id),
+          title: "<b>" + (n.label || n.id) + "</b><br>ID: " + n.id +
+                 "<br>度数: " + n.degree + "<br>社群: " + (n.community >= 0 ? n.community : "—"),
+          color: { background: c, border: c, highlight: { background: c, border: "#fff" } },
+          value: 1 + Math.log(1 + (n.degree || 0)),
+        };
+      });
+      const edgeArr = edges.map((e) => ({
+        from: e.from, to: e.to, value: e.weight || 1,
+        title: "权重 " + (e.weight != null ? e.weight : 1),
+      }));
+      return { nodeArr, edgeArr };
+    }
+
+    function renderGraph(nodes, edges, legendTitle) {
+      const { nodeArr, edgeArr } = buildGraphData(nodes, edges);
+      nodesData = new vis.DataSet(nodeArr);
+      edgesData = new vis.DataSet(edgeArr);
+      currentNodes = nodes;
+      currentEdges = edges;
+
+      const container = document.getElementById("network");
+      network = new vis.Network(container, { nodes: nodesData, edges: edgesData }, OPTIONS);
+
+      network.on("click", (params) => {
+        if (params.nodes.length) {
+          showNodeInfo(params.nodes[0]);
+        }
+      });
+      network.once("stabilizationIterationsDone", () => { network.fit(); });
+
+      renderLegend(nodes, legendTitle);
+    }
+
+    function renderLegend(nodes, title) {
+      const counts = {};
+      for (const n of nodes) {
+        const k = n.community >= 0 ? n.community : "none";
+        counts[k] = (counts[k] || 0) + 1;
+      }
+      let html = "<strong>" + (title || "社群图例") + "</strong>";
+      const keys = Object.keys(counts).sort((a, b) => (a === "none" ? 1 : b === "none" ? -1 : a - b));
+      for (const k of keys) {
+        const c = k === "none" ? "#9aa7bd" : C.colorFor(parseInt(k, 10));
+        const label = k === "none" ? "未归属" : "社群 " + k;
+        html += '<div class="lg-item"><span class="swatch" style="background:' + c + '"></span>' +
+                label + ' <span class="faint">(' + counts[k] + ")</span></div>";
+      }
+      document.getElementById("legend").innerHTML = html;
+    }
+
+    function showNodeInfo(id) {
+      const n = currentNodes.find((x) => x.id === id);
+      if (!n) return;
+      const box = document.getElementById("nodeInfo");
+      const tags = (n.tags || []).map((t) => '<span class="tag">' + C.escapeHtml(t) + "</span>").join(" ");
+      box.innerHTML =
+        '<div class="row wrap">' +
+        '<span class="badge brand">ID ' + id + "</span>" +
+        '<strong>' + C.escapeHtml(n.label) + "</strong>" +
+        '<span class="badge info">度数 ' + n.degree + "</span>" +
+        (n.community >= 0 ? '<span class="badge">社群 ' + n.community + "</span>" : "") +
+        "</div>" +
+        '<div class="mt-8">标签：' + (tags || '<span class="faint">无</span>') + "</div>";
+    }
+
+    function loadFull() {
+      const box = document.getElementById("nodeInfo");
+      box.innerHTML = C.spinner();
+      mode = "full";
+      api.graph({ limit: 2000 }).then((d) => {
+        renderGraph(d.nodes, d.edges, "全图社群");
+        box.innerHTML = '<span class="small muted">共 ' + d.stats.nodes + " 节点 / " + d.stats.edges + " 条边（显示前 " + d.nodes.length + " 节点）。点击节点查看详情。</span>";
+      }).catch((e) => { box.innerHTML = C.emptyState("⚠", e.message); });
+    }
+
+    function focusNode() {
+      const id = parseInt(document.getElementById("focusNode").value, 10);
+      const depth = parseInt(document.getElementById("focusDepth").value, 10);
+      if (isNaN(id)) { C.toast("请输入有效节点 ID", "warning"); return; }
+      mode = "neighborhood";
+      api.neighborhood({ node: id, depth, limit: 1500 }).then((d) => {
+        renderGraph(d.nodes, d.edges, "节点 " + id + " 的 " + depth + " 跳邻域");
+        document.getElementById("nodeInfo").innerHTML =
+          '<span class="small muted">聚焦节点 ' + id + "，深度 " + depth + "，显示 " + d.nodes.length + " 节点。</span>";
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    function highlightPath() {
+      const src = parseInt(document.getElementById("pathSrc").value, 10);
+      const dst = parseInt(document.getElementById("pathDst").value, 10);
+      if (isNaN(src) || isNaN(dst)) { C.toast("请输入起点与终点 ID", "warning"); return; }
+      api.shortestPath(src, dst).then((r) => {
+        if (!r.path) { C.toast("两节点之间无路径", "warning"); return; }
+        const pathSet = new Set(r.path);
+        // 高亮路径节点与边
+        const nodeArr = currentNodes.map((n) => {
+          const c = pathSet.has(n.id) ? "#e09a2f" : colorOf(n.community);
+          const onPath = pathSet.has(n.id);
+          return {
+            id: n.id, label: n.label || String(n.id),
+            color: { background: c, border: c },
+            borderWidth: onPath ? 3 : 1.5,
+            value: onPath ? 25 : (1 + Math.log(1 + (n.degree || 0))),
+            title: (n.label || n.id) + (onPath ? " · 路径上" : ""),
+          };
+        });
+        const edgeArr = currentEdges.map((e) => {
+          const i = r.path.indexOf(e.from);
+          const onPath = i >= 0 && r.path[i + 1] === e.to;
+          return {
+            from: e.from, to: e.to,
+            color: onPath ? { color: "#e09a2f", highlight: "#e09a2f", opacity: 1 } : { color: "#c8d2e0", opacity: 0.35 },
+            width: onPath ? 4 : 1,
+          };
+        });
+        nodesData.update(nodeArr);
+        edgesData.update(edgeArr);
+        document.getElementById("nodeInfo").innerHTML =
+          '<div class="row wrap"><span class="badge warning">最短路径（' + r.algorithm + "）</span>" +
+          '<span class="badge">距离 ' + r.distance + "</span></div>" +
+          '<div class="path-hops mt-8">' +
+          r.path.map((p, i) => (i ? '<span class="hop arrow">→</span>' : "") + '<span class="hop">' + p + "</span>").join("") +
+          "</div>";
+        network.fit({ nodes: r.path, animation: true });
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    C.initPage("graph", function () {
+      document.getElementById("btnFull").addEventListener("click", loadFull);
+      document.getElementById("btnReload").addEventListener("click", () => { if (mode === "full") loadFull(); else focusNode(); });
+      document.getElementById("btnFocus").addEventListener("click", focusNode);
+      document.getElementById("btnPath").addEventListener("click", highlightPath);
+      document.getElementById("btnFit").addEventListener("click", () => { if (network) network.fit({ animation: true }); });
+      document.getElementById("btnClearPath").addEventListener("click", () => { loadFull(); });
+
+      document.getElementById("btnPhysics").addEventListener("click", () => {
+        physicsOn = !physicsOn;
+        if (network) network.setOptions({ physics: { enabled: physicsOn } });
+        document.getElementById("btnPhysics").textContent = physicsOn ? "物理引擎：开" : "物理引擎：关";
+      });
+      document.getElementById("btnZoomIn").addEventListener("click", () => { if (network) network.moveTo({ scale: network.getScale() * 1.2 }); });
+      document.getElementById("btnZoomOut").addEventListener("click", () => { if (network) network.moveTo({ scale: network.getScale() / 1.2 }); });
+
+      loadFull();
+    });
+  </script>
+</body>
+</html>

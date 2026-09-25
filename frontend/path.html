@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>路径与共同好友 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>路径与共同好友</h1>
+            <p class="desc">BFS / 双向 BFS 最短路径查询与共同好友分析，附带 Jaccard 相似度与 Adamic-Adar 链接预测得分。</p>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="row wrap">
+            <div class="field-group" style="flex:1;min-width:140px;margin-bottom:0">
+              <label class="field">起点 ID</label>
+              <input class="input" id="src" type="number" placeholder="如 1">
+            </div>
+            <div class="field-group" style="flex:1;min-width:140px;margin-bottom:0">
+              <label class="field">终点 ID</label>
+              <input class="input" id="dst" type="number" placeholder="如 60">
+            </div>
+            <div class="field-group" style="min-width:160px;margin-bottom:0">
+              <label class="field">算法</label>
+              <select class="select" id="algo">
+                <option value="auto">自动（大图用双向）</option>
+                <option value="bfs">BFS</option>
+                <option value="bidirectional">双向 BFS</option>
+              </select>
+            </div>
+            <div class="field-group" style="margin-bottom:0;align-self:flex-end">
+              <button class="btn btn-primary btn-lg" id="btnQuery">查询</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid cols-2 mt-16">
+          <div class="card">
+            <div class="card-title">最短路径</div>
+            <div id="pathResult" class="card-body"></div>
+          </div>
+          <div class="card">
+            <div class="card-title">共同好友</div>
+            <div id="commonResult" class="card-body"></div>
+          </div>
+        </div>
+
+        <div class="card mt-16">
+          <div class="card-head">
+            <div class="card-title">路径可视化</div>
+            <span class="badge" id="pathMeta"></span>
+          </div>
+          <div id="pathViz" class="small muted">查询后将在此显示路径链。</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+
+    function query() {
+      const src = parseInt(document.getElementById("src").value, 10);
+      const dst = parseInt(document.getElementById("dst").value, 10);
+      if (isNaN(src) || isNaN(dst)) { C.toast("请输入起点与终点 ID", "warning"); return; }
+      const algo = document.getElementById("algo").value;
+
+      const pBox = document.getElementById("pathResult");
+      const cBox = document.getElementById("commonResult");
+      pBox.innerHTML = C.spinner();
+      cBox.innerHTML = C.spinner();
+
+      api.shortestPath(src, dst, algo).then((r) => {
+        renderPath(pBox, r);
+        renderViz(r);
+      }).catch((e) => { pBox.innerHTML = C.emptyState("⚠", e.message); });
+
+      api.commonFriends(src, dst).then((r) => {
+        renderCommon(cBox, r);
+      }).catch((e) => { cBox.innerHTML = C.emptyState("⚠", e.message); });
+    }
+
+    function renderPath(box, r) {
+      if (!r.path) {
+        box.innerHTML = C.emptyState("🚫", "节点之间不存在可达路径");
+        return;
+      }
+      const hops = r.path.map((p, i) =>
+        (i ? '<span class="hop arrow">→</span>' : "") + '<span class="hop">' + p + "</span>"
+      ).join("");
+      box.innerHTML =
+        '<div class="row wrap mb-8">' +
+        '<span class="badge success">' + r.algorithm + "</span>" +
+        '<span class="badge brand">距离 ' + r.distance + "</span>" +
+        '<span class="badge">' + r.hops + " 跳</span>" +
+        "</div>" +
+        '<div class="path-hops">' + hops + "</div>";
+    }
+
+    function renderCommon(box, r) {
+      if (!r.common.length) {
+        box.innerHTML = C.emptyState("👤", "无共同好友");
+        return;
+      }
+      const list = r.common.map((c) => '<span class="badge brand">' + c + "</span>").join(" ");
+      box.innerHTML =
+        '<div class="mb-8">共同好友 <strong>' + r.count + "</strong> 位：</div>" +
+        '<div class="row wrap">' + list + "</div>" +
+        '<hr style="border:none;border-top:1px solid var(--border);margin:16px 0">' +
+        '<div class="row spread"><span class="muted">Jaccard 相似度</span><span class="mono">' + r.jaccard + "</span></div>" +
+        '<div class="row spread mt-8"><span class="muted">Adamic-Adar 得分</span><span class="mono">' + r.adamic_adar + "</span></div>";
+    }
+
+    function renderViz(r) {
+      const box = document.getElementById("pathViz");
+      const meta = document.getElementById("pathMeta");
+      if (!r.path) { box.innerHTML = '<span class="faint">无可视化内容。</span>'; meta.textContent = "无路径"; return; }
+      meta.textContent = r.algorithm + " · 距离 " + r.distance;
+      const N = r.path.length;
+      let html = '<div class="path-hops" style="font-size:15px">';
+      for (let i = 0; i < N; i++) {
+        const p = r.path[i];
+        html += '<div style="text-align:center"><div class="rec-rank' + (i === 0 || i === N - 1 ? " top" : "") + '" style="width:52px;height:52px;font-size:18px">' + p + "</div>";
+        if (i === 0) html += '<div class="small faint mt-8">起点</div>';
+        else if (i === N - 1) html += '<div class="small faint mt-8">终点</div>';
+        html += "</div>";
+        if (i < N - 1) html += '<div class="hop arrow" style="font-size:22px">→</div>';
+      }
+      html += "</div>";
+      html += '<div class="small muted mt-16">共 ' + (N - 1) + " 跳，路径长度 " + r.distance + "。</div>";
+      box.innerHTML = html;
+    }
+
+    C.initPage("path", function () {
+      document.getElementById("btnQuery").addEventListener("click", query);
+      document.getElementById("src").addEventListener("keyup", (e) => { if (e.key === "Enter") query(); });
+      document.getElementById("dst").addEventListener("keyup", (e) => { if (e.key === "Enter") query(); });
+      // 默认示例
+      document.getElementById("src").value = 1;
+      document.getElementById("dst").value = 60;
+      query();
+    });
+  </script>
+</body>
+</html>

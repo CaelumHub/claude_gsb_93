@@ -1,0 +1,195 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>系统设置 · 社交网络图分析</title>
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+  <div id="app">
+    <aside id="sidebar"></aside>
+    <main id="main">
+      <header id="topbar"></header>
+      <section id="content">
+        <div class="page-head">
+          <div>
+            <h1>系统设置</h1>
+            <p class="desc">调整图渲染、推荐策略、算法超参与存储参数。修改后立即持久化。</p>
+          </div>
+          <div class="actions">
+            <button class="btn btn-danger" id="btnReset">恢复默认</button>
+            <button class="btn btn-primary" id="btnSave">保存设置</button>
+          </div>
+        </div>
+
+        <form id="settingsForm">
+          <div class="grid cols-2">
+            <div class="card">
+              <div class="card-title">图渲染</div>
+              <div class="card-body">
+                <div class="field-group">
+                  <label class="field">布局算法</label>
+                  <select class="select" id="graph.layout">
+                    <option value="force">力导向（Force）</option>
+                    <option value="hierarchical">层级</option>
+                    <option value="circle">环形</option>
+                  </select>
+                </div>
+                <div class="field-group">
+                  <label class="field">默认节点颜色</label>
+                  <input class="input" id="graph.defaultNodeColor" type="color" style="height:40px">
+                </div>
+                <div class="field-group">
+                  <label class="field">最大渲染节点数</label>
+                  <input class="input" id="graph.maxRenderNodes" type="number" min="100" max="5000">
+                </div>
+                <label class="row"><input type="checkbox" id="graph.showLabels"> 显示节点标签</label>
+                <label class="row mt-8"><input type="checkbox" id="graph.edgeSmoothing"> 边平滑</label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">推荐策略</div>
+              <div class="card-body">
+                <div class="field-group">
+                  <label class="field">推荐策略</label>
+                  <select class="select" id="recommendation.strategy">
+                    <option value="hybrid">混合（hybrid）</option>
+                    <option value="cf">协同过滤（cf）</option>
+                    <option value="embedding">图嵌入（embedding）</option>
+                    <option value="popularity">热门基线（popularity）</option>
+                  </select>
+                </div>
+                <div class="field-group">
+                  <label class="field">默认推荐数量 K</label>
+                  <input class="input" id="recommendation.k" type="number" min="1" max="50">
+                </div>
+                <div class="field-group">
+                  <label class="field">多样性 λ（MMR）</label>
+                  <input class="input" id="recommendation.diversity" type="number" step="0.05" min="0" max="1">
+                </div>
+                <label class="row"><input type="checkbox" id="recommendation.useTags"> 使用标签信号</label>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">算法超参</div>
+              <div class="card-body">
+                <div class="field-group">
+                  <label class="field">PageRank 阻尼系数</label>
+                  <input class="input" id="algorithm.pagerankDamping" type="number" step="0.01" min="0.5" max="0.99">
+                </div>
+                <div class="field-group">
+                  <label class="field">Louvain 分辨率</label>
+                  <input class="input" id="algorithm.louvainResolution" type="number" step="0.1" min="0.1" max="5">
+                </div>
+                <div class="field-group">
+                  <label class="field">Louvain 收敛容差</label>
+                  <input class="input" id="algorithm.louvainTolerance" type="number" step="0.0000001" min="0">
+                </div>
+              </div>
+            </div>
+
+            <div class="card">
+              <div class="card-title">存储与系统</div>
+              <div class="card-body">
+                <div class="field-group">
+                  <label class="field">分片数量</label>
+                  <input class="input" id="storage.shardCount" type="number" min="1" max="256">
+                </div>
+                <label class="row"><input type="checkbox" id="storage.autoFlush"> 自动刷写分片</label>
+                <div class="field-group mt-16">
+                  <label class="field">系统名称</label>
+                  <input class="input" id="system.name">
+                </div>
+                <label class="row"><input type="checkbox" id="system.darkMode"> 深色模式</label>
+              </div>
+            </div>
+          </div>
+        </form>
+      </section>
+    </main>
+  </div>
+
+  <script src="js/api.js"></script>
+  <script src="js/common.js"></script>
+  <script>
+    const C = common;
+    const FLAT = {
+      "graph.layout": "select",
+      "graph.defaultNodeColor": "text",
+      "graph.maxRenderNodes": "number",
+      "graph.showLabels": "checkbox",
+      "graph.edgeSmoothing": "checkbox",
+      "recommendation.strategy": "select",
+      "recommendation.k": "number",
+      "recommendation.diversity": "number",
+      "recommendation.useTags": "checkbox",
+      "algorithm.pagerankDamping": "number",
+      "algorithm.louvainResolution": "number",
+      "algorithm.louvainTolerance": "number",
+      "storage.shardCount": "number",
+      "storage.autoFlush": "checkbox",
+      "system.name": "text",
+      "system.darkMode": "checkbox",
+    };
+
+    function get(path) {
+      const keys = path.split(".");
+      let obj = current;
+      for (const k of keys) obj = (obj || {})[k];
+      return obj;
+    }
+    let current = {};
+
+    function load() {
+      api.settings().then((s) => {
+        current = s;
+        for (const path in FLAT) {
+          const el = document.getElementById(path);
+          if (!el) continue;
+          const v = get(path);
+          if (FLAT[path] === "checkbox") el.checked = !!v;
+          else el.value = v;
+        }
+      }).catch((e) => C.toast(e.message, "error"));
+    }
+
+    function collect() {
+      const patch = {};
+      for (const path in FLAT) {
+        const el = document.getElementById(path);
+        if (!el) continue;
+        let v;
+        if (FLAT[path] === "checkbox") v = el.checked;
+        else if (FLAT[path] === "number") v = parseFloat(el.value);
+        else v = el.value;
+        const keys = path.split(".");
+        let node = patch;
+        for (let i = 0; i < keys.length - 1; i++) { node[keys[i]] = node[keys[i]] || {}; node = node[keys[i]]; }
+        node[keys[keys.length - 1]] = v;
+      }
+      return patch;
+    }
+
+    C.initPage("settings", function () {
+      document.getElementById("btnSave").addEventListener("click", () => {
+        api.saveSettings(collect()).then(() => {
+          C.toast("设置已保存", "success");
+          // 若深色模式变化则应用
+          const dark = document.getElementById("system.darkMode").checked;
+          localStorage.setItem("gsb-dark", dark ? "1" : "0");
+          C.applyTheme();
+        }).catch((e) => C.toast(e.message, "error"));
+      });
+      document.getElementById("btnReset").addEventListener("click", async () => {
+        const ok = await C.confirmDialog("确定恢复所有设置为默认值？");
+        if (!ok) return;
+        api.resetSettings().then(() => { load(); C.toast("已恢复默认设置", "success"); }).catch((e) => C.toast(e.message, "error"));
+      });
+      load();
+    });
+  </script>
+</body>
+</html>
