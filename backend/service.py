@@ -17,6 +17,8 @@ Responsibilities
 
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import threading
 from collections import Counter, defaultdict
@@ -74,6 +76,11 @@ class SocialGraphService:
         self._community_dirty = False
         self._pagerank_dirty = False
 
+        # Staged import prechecks: token -> {"plan", "created_at", "source"}.
+        # A plan is the *only* artefact shared between precheck and commit; it
+        # is single-use and expires after IMPORT_PREVIEW_TTL_MS.
+        self._import_staging: Dict[str, dict] = {}
+
     # ------------------------------------------------------------------
     # Graph access / caching
     # ------------------------------------------------------------------
@@ -94,6 +101,281 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+
+    # ------------------------------------------------------------------
+    # Edge import: two-phase precheck / commit
+    # ------------------------------------------------------------------
+    IMPORT_PREVIEW_LIMIT = 200
+    IMPORT_PREVIEW_TTL_MS = 30 * 60 * 1000      # staged plans live 30 minutes
+    IMPORT_STAGING_MAX = 32
+
+    def plan_import(
+        self,
+        rows: List[Tuple[int, int, float]],
+        malformed: int = 0,
+        source: str = "manual",
+    ) -> dict:
+        """Classify every raw row without touching the graph, then stage it.
+
+        The returned plan is the single source of truth used by both the
+        precheck response and the later commit, so classifications shown to
+        the user can never diverge from what gets written.
+        """
+        with self._lock:
+            plan = self._build_import_plan(rows, malformed)
+            token = hashlib.sha256(os.urandom(24)).hexdigest()[:24]
+            self._import_staging[token] = {
+                "plan": plan,
+                "source": source,
+                "created_at": config.now_ms(),
+            }
+            self._gc_staging_locked()
+            return {**self._public_plan(plan), "token": token}
+
+    def get_staged_plan(self, token: str) -> Optional[dict]:
+        """Fetch a previously produced precheck result (result reuse)."""
+        with self._lock:
+            staged = self._import_staging.get(token)
+            if staged is None:
+                return None
+            if config.now_ms() - staged["created_at"] > self.IMPORT_PREVIEW_TTL_MS:
+                self._import_staging.pop(token, None)
+                return None
+            return {**self._public_plan(staged["plan"]), "token": token}
+
+    def commit_import(self, token: str) -> dict:
+        """Write exactly the edges a staged precheck marked as valid.
+
+        Safety checks before writing:
+        1. the token must identify an unexpired, single-use staged plan;
+        2. every touched shard must still carry the fingerprint recorded at
+           precheck time (fast state-drift guard);
+        3. the whole classification is re-run against the current graph and
+           must match the staged one (authoritative guard).
+        Any mismatch aborts before a single shard is written.
+        """
+        with self._lock:
+            staged = self._import_staging.pop(token, None)
+            if staged is None:
+                raise KeyError("预检记录不存在或已被使用，请重新预检")
+            plan = staged["plan"]
+            now = config.now_ms()
+            if now - staged["created_at"] > self.IMPORT_PREVIEW_TTL_MS:
+                raise KeyError("预检结果已过期，请重新预检")
+
+            current = self.store.shard_fingerprints(plan["fingerprints"].keys())
+            if current != plan["fingerprints"]:
+                raise ValueError("自预检后图数据已发生变化，为避免数据错乱请重新预检")
+
+            replay = self._build_import_plan(
+                [(e["u"], e["v"], e["w"]) for e in plan["items"]],
+                plan["counts"]["malformed"],
+            )
+            if replay["input_sig"] != plan["input_sig"]:
+                raise ValueError("当前图状态与预检时不一致，请重新预检后再导入")
+
+            write_result = self.store.import_validated_edges(
+                [tuple(edge) for edge in plan["valid_edges"]]
+            )
+            if write_result["written"] != plan["counts"]["valid"]:
+                # Defensive: should be impossible after the replay check.  No
+                # partial plan accounting is ever reported as success.
+                self.invalidate_graph()
+                raise RuntimeError(
+                    f"写入数量({write_result['written']})与预检结果"
+                    f"({plan['counts']['valid']})不一致，已中止，请检查分片"
+                )
+            self.invalidate_graph()
+
+            result = {
+                "token": token,
+                "source": staged.get("source", "manual"),
+                "written": write_result["written"],
+                "deduped": plan["counts"]["duplicate"],
+                "self_loops": plan["counts"]["self_loop"],
+                "missing_users": plan["counts"]["missing_user"],
+                "malformed": plan["counts"]["malformed"],
+                "touched_shards": write_result["touched_shards"],
+                "would_isolate": len(plan["would_isolate"]),
+                "isolated_connected": plan["isolated_connected"],
+                "time": now,
+            }
+            storage.log_import(result)
+            return result
+
+    def import_edges_legacy(self, rows: List[Tuple[int, int, float]], source: str = "manual") -> dict:
+        """Backwards-compatible direct import (used by the old POST /api/import).
+
+        Goes through the same validated writer so callers bypassing precheck
+        still get dedupe/self-loop-safe writes.
+        """
+        with self._lock:
+            plan = self._build_import_plan(rows, 0)
+            write_result = self.store.import_validated_edges(
+                [tuple(edge) for edge in plan["valid_edges"]]
+            )
+            self.invalidate_graph()
+            result = {
+                "imported": write_result["written"],
+                "skipped": plan["counts"]["duplicate"],
+                "self_loops": plan["counts"]["self_loop"] + plan["counts"]["missing_user"],
+                "touched_shards": write_result["touched_shards"],
+            }
+            storage.log_import({**result, "source": source, "time": config.now_ms()})
+            return result
+
+    def _gc_staging_locked(self) -> None:
+        deadline = config.now_ms() - self.IMPORT_PREVIEW_TTL_MS
+        expired = [t for t, s in self._import_staging.items() if s["created_at"] < deadline]
+        for t in expired:
+            self._import_staging.pop(t, None)
+        if len(self._import_staging) <= self.IMPORT_STAGING_MAX:
+            return
+        oldest = sorted(self._import_staging.items(), key=lambda kv: kv[1]["created_at"])
+        for t, _ in oldest[: len(self._import_staging) - self.IMPORT_STAGING_MAX]:
+            self._import_staging.pop(t, None)
+
+    @staticmethod
+    def _edge_key(u: int, v: int) -> Tuple[int, int]:
+        return (u, v) if u < v else (v, u)
+
+    def _build_import_plan(self, rows: List[Tuple[int, int, float]], malformed: int = 0) -> dict:
+        """Pure classification: same code path for precheck and commit replay."""
+        users = self.store.load_users()
+        existing_users: Set[int] = set(users.keys())
+
+        items: List[dict] = []
+        valid_edges: List[List[float]] = []
+        self_loop_lines: List[int] = []
+        missing_lines: List[int] = []
+        duplicate_lines: List[int] = []
+        valid_lines: List[int] = []
+
+        # Pre-load only the shards the batch references (both endpoints' shards
+        # -- an undirected edge physically lives in one of them).
+        touched_shards: Set[int] = set()
+        for u, v, _w in rows:
+            touched_shards.add(storage._user_shard(int(u)))
+            touched_shards.add(storage._user_shard(int(v)))
+        existing_keys = self.store.canonical_edge_keys(touched_shards)
+        local_nodes = self.store.shard_endpoint_nodes(touched_shards)
+        fingerprints = self.store.shard_fingerprints(touched_shards)
+
+        seen_in_batch: Set[Tuple[int, int]] = set()
+        accepted_endpoints: Set[int] = set()
+        first_dup_line: Dict[Tuple[int, int], int] = {}
+
+        for idx, row in enumerate(rows):
+            u, v = int(row[0]), int(row[1])
+            w = float(row[2])
+            key = self._edge_key(u, v)
+            if u == v:
+                reason, lines = "self_loop", self_loop_lines
+            elif u not in existing_users or v not in existing_users:
+                reason, lines = "missing_user", missing_lines
+                missing_ids = [x for x in (u, v) if x not in existing_users]
+            elif key in existing_keys or key in seen_in_batch:
+                reason, lines = "duplicate", duplicate_lines
+                if key not in first_dup_line:
+                    first_dup_line[key] = idx
+            else:
+                reason, lines = "valid", valid_lines
+            if reason == "valid":
+                seen_in_batch.add(key)
+                accepted_endpoints.add(u)
+                accepted_endpoints.add(v)
+                valid_edges.append([key[0], key[1], w])
+            item = {
+                "line": idx + 1,
+                "u": u,
+                "v": v,
+                "w": round(w, 4),
+                "reason": reason,
+            }
+            if reason == "missing_user":
+                item["missing"] = missing_ids
+            elif reason == "duplicate":
+                where = "existing" if key in existing_keys else "batch"
+                item["duplicate_of"] = where
+                item["first_line"] = (
+                    None if where == "existing" else first_dup_line.get(key)
+                )
+            items.append(item)
+            lines.append(idx + 1)
+
+        # Nodes the batch mentions that do not exist in users or graph and end
+        # up with zero accepted edges: a naive writer would register them as
+        # isolated nodes.
+        ghost_nodes: Dict[int, List[int]] = defaultdict(list)
+        for item in items:
+            if item["reason"] == "valid":
+                continue
+            for x in (item["u"], item["v"]):
+                if x not in existing_users and x not in local_nodes and x not in accepted_endpoints:
+                    ghost_nodes[x].append(item["line"])
+
+        # Existing but currently isolated users rescued (connected) by valid rows.
+        isolated_connected = sorted(
+            x for x in accepted_endpoints if x in existing_users and x not in local_nodes
+        )
+
+        would_isolate = [
+            {"node": node, "lines": sorted(set(lines))}
+            for node, lines in sorted(ghost_nodes.items())
+        ]
+
+        counts = {
+            "input": len(rows),
+            "malformed": int(malformed),
+            "self_loop": len(self_loop_lines),
+            "missing_user": len(missing_lines),
+            "duplicate": len(duplicate_lines),
+            "valid": len(valid_lines),
+        }
+        limit = self.IMPORT_PREVIEW_LIMIT
+        sig_src = json.dumps(
+            [counts, sorted(seen_in_batch), sorted(ghost_nodes.keys())],
+            separators=(",", ":"),
+        )
+        return {
+            "items": items,
+            "valid_edges": valid_edges,
+            "counts": counts,
+            "details": {
+                "self_loop": [items[i - 1] for i in self_loop_lines[:limit]],
+                "missing_user": [items[i - 1] for i in missing_lines[:limit]],
+                "duplicate": [items[i - 1] for i in duplicate_lines[:limit]],
+                "valid": [items[i - 1] for i in valid_lines[:limit]],
+            },
+            "truncated": {
+                k: max(0, len(v) - limit)
+                for k, v in (
+                    ("self_loop", self_loop_lines),
+                    ("missing_user", missing_lines),
+                    ("duplicate", duplicate_lines),
+                    ("valid", valid_lines),
+                )
+            },
+            "would_isolate": would_isolate[:limit],
+            "would_isolate_truncated": max(0, len(would_isolate) - limit),
+            "isolated_connected": isolated_connected[:limit],
+            "isolated_connected_total": len(isolated_connected),
+            "touched_shards": len(touched_shards),
+            "fingerprints": fingerprints,
+            "input_sig": hashlib.sha256(sig_src.encode("utf-8")).hexdigest(),
+        }
+
+    def _public_plan(self, plan: dict) -> dict:
+        return {
+            "counts": plan["counts"],
+            "details": plan["details"],
+            "truncated": plan["truncated"],
+            "would_isolate": plan["would_isolate"],
+            "would_isolate_truncated": plan["would_isolate_truncated"],
+            "isolated_connected": plan["isolated_connected"],
+            "isolated_connected_total": plan["isolated_connected_total"],
+            "touched_shards": plan["touched_shards"],
+        }
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()

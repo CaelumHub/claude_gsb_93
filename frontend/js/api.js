@@ -66,6 +66,10 @@
 
     // 关系导入
     importEdges: (edges, source) => request("POST", "/api/import", { edges, source }),
+    previewImport: (edges, source) =>
+      request("POST", "/api/import/preview", { edges, source: source || "manual" }),
+    getImportPreview: (token) => request("GET", "/api/import/preview/" + token),
+    commitImport: (token) => request("POST", "/api/import/commit", { token }),
 
     // 图
     graph: (p) => request("GET", "/api/graph" + qs(p)),

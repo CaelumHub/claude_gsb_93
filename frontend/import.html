@@ -15,19 +15,21 @@
         <div class="page-head">
           <div>
             <h1>关系导入</h1>
-            <p class="desc">批量导入好友关系（边）。系统按用户分片存储，增量导入只触达受影响的分片，随后自动维护索引。</p>
+            <p class="desc">先预检、再写入：系统会识别重复边、自环、指向不存在用户的边以及会造成孤立节点的端点，确认无误后才真正落库。</p>
           </div>
           <div class="actions">
             <button class="btn" id="btnSample">填充示例</button>
-            <button class="btn btn-primary" id="btnImport">⇄ 导入关系</button>
+            <button class="btn" id="btnPreview">🔍 预检</button>
+            <button class="btn btn-primary" id="btnCommit" disabled>✓ 确认写入</button>
           </div>
         </div>
 
         <div class="grid cols-3">
           <div class="card" style="grid-column: span 2">
             <div class="card-title">边列表</div>
-            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔。</p>
+            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔；<code>#</code> 开头为注释。</p>
             <textarea class="textarea mt-8" id="edgeInput" rows="12" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5"></textarea>
+            <p class="small muted mt-8" id="parseHint">尚未解析。</p>
           </div>
           <div class="card">
             <div class="card-title">导入结果</div>
@@ -48,6 +50,14 @@
           </div>
         </div>
 
+        <div class="card mt-16" id="previewCard" style="display:none">
+          <div class="card-head">
+            <div class="card-title">预检结果 <span class="small muted" id="previewMeta"></span></div>
+            <span class="badge" id="previewState"></span>
+          </div>
+          <div id="previewBody" class="mt-8"></div>
+        </div>
+
         <div class="card mt-16">
           <div class="card-head">
             <div class="card-title">最近导入记录</div>
@@ -63,43 +73,176 @@
   <script src="js/common.js"></script>
   <script>
     const C = common;
+    let lastToken = null;
+    let lastPlan = null;
 
     function parseEdges(text) {
       const edges = [];
+      let malformed = 0, total = 0;
       const lines = text.split(/\r?\n/);
       for (const line of lines) {
         const t = line.trim();
         if (!t || t.startsWith("#")) continue;
+        total++;
         const parts = t.split(/[\s,;\t]+/).filter(Boolean);
-        if (parts.length < 2) continue;
+        if (parts.length < 2) { malformed++; continue; }
         const u = parseInt(parts[0], 10);
         const v = parseInt(parts[1], 10);
-        if (isNaN(u) || isNaN(v)) continue;
+        if (isNaN(u) || isNaN(v)) { malformed++; continue; }
         let w = 1.0;
         if (parts.length >= 3 && !isNaN(parseFloat(parts[2]))) w = parseFloat(parts[2]);
         edges.push([u, v, w]);
       }
-      return edges;
+      return { edges, malformed, total };
     }
 
-    function doImport(edges, source) {
-      if (!edges.length) { C.toast("没有可导入的边", "warning"); return; }
-      const btn = document.getElementById("btnImport");
-      btn.disabled = true; btn.textContent = "导入中…";
-      api.importEdges(edges, source)
-        .then((r) => {
-          const box = document.getElementById("importResult");
-          box.innerHTML =
-            '<div class="badge success">成功</div>' +
-            '<div class="mt-8">导入 <strong>' + r.imported + "</strong> 条边</div>" +
-            '<div class="mt-8">跳过重复 <strong>' + r.skipped + "</strong> 条</div>" +
-            '<div class="mt-8">自环忽略 <strong>' + r.self_loops + "</strong> 条</div>" +
-            '<div class="mt-8">触达分片 <strong>' + r.touched_shards + "</strong> 个</div>";
-          C.toast("已导入 " + r.imported + " 条关系", "success");
-          loadLog();
+    function markStale(msg) {
+      lastToken = null;
+      lastPlan = null;
+      const btn = document.getElementById("btnCommit");
+      btn.disabled = true;
+      const state = document.getElementById("previewState");
+      if (state) { state.className = "badge warning"; state.textContent = msg || "边列表已修改，请重新预检"; }
+    }
+
+    function statBadge(label, value, cls, title) {
+      return '<div class="badge ' + (cls || "") + '" title="' + C.escapeHtml(title || "") +
+        '" style="font-size:13px;padding:6px 10px;margin:4px 6px 4px 0">' +
+        C.escapeHtml(label) + " <strong>" + C.fmt(value) + "</strong></div>";
+    }
+
+    function edgeRows(items, extraCols) {
+      let html = '<div class="table-wrap"><table class="table"><thead><tr>' +
+        "<th>行号</th><th>u</th><th>v</th><th>权重</th>" +
+        (extraCols ? extraCols.head : "") + "</tr></thead><tbody>";
+      if (!items.length) {
+        html += '<tr><td colspan="5" style="text-align:center;color:var(--text-faint);padding:16px">无</td></tr>';
+      } else {
+        for (const it of items) {
+          html += "<tr><td>" + it.line + "</td><td>" + it.u + "</td><td>" + it.v +
+            "</td><td>" + it.w + "</td>" + (extraCols ? extraCols.cell(it) : "") + "</tr>";
+        }
+      }
+      return html + "</tbody></table></div>";
+    }
+
+    function section(title, cls, items, truncated, extraCols) {
+      let html = '<details class="mt-8" ' + (items.length ? "open" : "") + ">" +
+        '<summary><span class="badge ' + cls + '">' + C.escapeHtml(title) +
+        " " + items.length + " 条</span>" +
+        (truncated ? '<span class="small muted">（仅预览前 200 条，另有 ' + truncated + " 条）</span>" : "") +
+        "</summary><div class='mt-8'>" + edgeRows(items.slice(0, 200), extraCols) +
+        "</div></details>";
+      return html;
+    }
+
+    function renderPlan(plan) {
+      lastPlan = plan;
+      const card = document.getElementById("previewCard");
+      card.style.display = "";
+      const c = plan.counts;
+      const state = document.getElementById("previewState");
+      const canCommit = c.valid > 0;
+      state.className = "badge " + (canCommit ? "success" : "warning");
+      state.textContent = canCommit ? "预检完成，待确认写入" : "没有可写入的边";
+      document.getElementById("previewMeta").textContent =
+        "· 触达分片 " + plan.touched_shards + " · token " + lastToken.slice(0, 8) + "…";
+
+      let html = "<div class='row wrap'>" +
+        statBadge("解析行", c.input + c.malformed) +
+        statBadge("格式错误", c.malformed, c.malformed ? "danger" : "", "无法解析为 u v 的行") +
+        statBadge("自环", c.self_loop, c.self_loop ? "danger" : "", "u == v，导入时忽略") +
+        statBadge("指向不存在用户", c.missing_user, c.missing_user ? "danger" : "", "端点不在用户档案中，不写入") +
+        statBadge("重复边", c.duplicate, c.duplicate ? "warning" : "", "与库存边或批内重复（无向，反向视为同一条）") +
+        statBadge("可写入", c.valid, "brand", "去重后真正生效的新边") +
+        "</div>";
+
+      if (plan.would_isolate.length) {
+        const ids = plan.would_isolate.map((x) => x.node);
+        html += '<div class="mt-8"><span class="badge danger">⚠ 会产生孤立节点</span> ' +
+          '<span class="small muted">以下端点既无用户档案，本批中涉及它们的边又全部被拦截；' +
+          "若直接写库会把它们注册为度数 0 的孤立节点，本次导入将不会写入这些端点。</span>" +
+          '<div class="small mt-8"><code>' + C.escapeHtml(ids.join(", ")) + "</code>" +
+          (plan.would_isolate_truncated ? "（仅显示前 200 个，另有 " + plan.would_isolate_truncated + " 个）" : "") +
+          "</div></div>";
+      } else if (c.missing_user || c.self_loop) {
+        html += '<div class="mt-8 small muted">✓ 不存在会因被拦截边而成为孤立节点的端点。</div>';
+      }
+      if (plan.isolated_connected_total) {
+        html += '<div class="mt-8"><span class="badge success">本次将连接 ' +
+          plan.isolated_connected_total + " 个当前孤立用户</span></div>";
+      }
+
+      const dupExtra = {
+        head: "<th>重复来源</th>",
+        cell: (it) => "<td>" + (it.duplicate_of === "existing" ? "与库存边重复"
+          : "批内重复（首次出现于第 " + it.first_line + " 行）") + "</td>",
+      };
+      const missExtra = {
+        head: "<th>不存在的端点</th>",
+        cell: (it) => "<td><code>" + C.escapeHtml((it.missing || []).join(", ")) + "</code></td>",
+      };
+      const t = plan.truncated;
+      html += section("自环明细", "danger", plan.details.self_loop, t.self_loop);
+      html += section("指向不存在用户的边", "danger", plan.details.missing_user, t.missing_user, missExtra);
+      html += section("重复边明细", "warning", plan.details.duplicate, t.duplicate, dupExtra);
+      html += section("可写入边预览", "brand", plan.details.valid, t.valid);
+      document.getElementById("previewBody").innerHTML = html;
+    }
+
+    function doPreview() {
+      const parsed = parseEdges(document.getElementById("edgeInput").value);
+      document.getElementById("parseHint").textContent =
+        "已解析 " + parsed.total + " 行，其中有效边 " + parsed.edges.length +
+        " 条，格式错误 " + parsed.malformed + " 条。";
+      if (!parsed.edges.length) { C.toast("没有可预检的边", "warning"); return; }
+      const btn = document.getElementById("btnPreview");
+      btn.disabled = true; btn.textContent = "预检中…";
+      api.previewImport(parsed.edges, "manual")
+        .then((plan) => {
+          lastToken = plan.token;
+          renderPlan(plan);
+          document.getElementById("btnCommit").disabled = plan.counts.valid <= 0;
+          C.toast("预检完成：可写入 " + plan.counts.valid + " 条，问题 " +
+            (plan.counts.self_loop + plan.counts.missing_user + plan.counts.duplicate) + " 条",
+            plan.counts.valid > 0 ? "success" : "warning");
         })
         .catch((e) => C.toast(e.message, "error"))
-        .finally(() => { btn.disabled = false; btn.textContent = "⇄ 导入关系"; });
+        .finally(() => { btn.disabled = false; btn.textContent = "🔍 预检"; });
+    }
+
+    async function doCommit() {
+      if (!lastToken || !lastPlan) { C.toast("请先预检", "warning"); return; }
+      const c = lastPlan.counts;
+      const ok = await C.confirmDialog(
+        "将按预检结果写入 " + c.valid + " 条边（去重 " + c.duplicate +
+        "、忽略自环 " + c.self_loop + "、拦截指向不存在用户 " + c.missing_user + "），是否继续？"
+      );
+      if (!ok) return;
+      const btn = document.getElementById("btnCommit");
+      btn.disabled = true; btn.textContent = "写入中…";
+      api.commitImport(lastToken)
+        .then((r) => {
+          lastToken = null; lastPlan = null;
+          document.getElementById("previewState").className = "badge success";
+          document.getElementById("previewState").textContent = "已写入";
+          document.getElementById("importResult").innerHTML =
+            '<div class="badge success">写入成功</div>' +
+            '<div class="mt-8">生效新边 <strong>' + r.written + "</strong> 条</div>" +
+            '<div class="mt-8">去重跳过 <strong>' + r.deduped + "</strong> 条</div>" +
+            '<div class="mt-8">自环忽略 <strong>' + r.self_loops + "</strong> 条</div>" +
+            '<div class="mt-8">指向不存在用户拦截 <strong>' + r.missing_users + "</strong> 条</div>" +
+            (r.would_isolate ? '<div class="mt-8">避免孤立节点 <strong>' + r.would_isolate + "</strong> 个</div>" : "") +
+            (r.isolated_connected ? '<div class="mt-8">连接既有孤立用户 <strong>' + r.isolated_connected + "</strong> 个</div>" : "") +
+            '<div class="mt-8">触达分片 <strong>' + r.touched_shards + "</strong> 个</div>";
+          C.toast("已生效 " + r.written + " 条边，去重 " + r.deduped + " 条", "success");
+          loadLog();
+        })
+        .catch((e) => {
+          C.toast(e.message, "error");
+          markStale("写入被拒绝，请重新预检");
+        })
+        .finally(() => { btn.disabled = !lastToken; btn.textContent = "✓ 确认写入"; });
     }
 
     function loadLog() {
@@ -114,12 +257,14 @@
           '<span class="badge info">分片 ' + shards.length + "</span>" +
           '<span class="badge brand">边 ' + totalEdges + "</span>" +
           '<span class="badge">节点 ' + s.graph.nodes + "</span>" +
+          '<span class="badge">孤立节点 ' + s.graph.isolated + "</span>" +
           "</div>";
       }).catch(() => { box.innerHTML = '<span class="faint">加载失败</span>'; });
     }
 
     function fillSample() {
-      const n = 30, deg = 6;
+      // 刻意混入自环、重复、反向重复与不存在用户，方便演示预检分类。
+      const n = 20, deg = 4;
       const lines = [];
       const rng = mulberry(42);
       for (let i = 1; i <= n; i++) {
@@ -128,7 +273,14 @@
           if (j !== i) lines.push(i + " " + j);
         }
       }
+      lines.push("5 5");                      // 自环
+      lines.push(lines[0]);                   // 批内重复
+      const parts = lines[1].split(" ");
+      lines.push(parts[1] + " " + parts[0]);  // 无向反向重复
+      lines.push("1 999999");                 // 指向不存在用户
+      lines.push("888888 777777");            // 仅出现在被拦截边 -> 孤立端点
       document.getElementById("edgeInput").value = lines.join("\n");
+      markStale();
     }
 
     function generateRandom() {
@@ -143,7 +295,8 @@
         }
       }
       document.getElementById("edgeInput").value = lines.join("\n");
-      C.toast("已生成 " + lines.length + " 条随机边", "success");
+      markStale();
+      C.toast("已生成 " + lines.length + " 条随机边，请先预检", "success");
     }
 
     // 确定性伪随机数（Mulberry32）
@@ -158,9 +311,9 @@
     }
 
     C.initPage("import", function () {
-      document.getElementById("btnImport").addEventListener("click", () => {
-        doImport(parseEdges(document.getElementById("edgeInput").value), "manual");
-      });
+      document.getElementById("btnPreview").addEventListener("click", doPreview);
+      document.getElementById("btnCommit").addEventListener("click", doCommit);
+      document.getElementById("edgeInput").addEventListener("input", () => markStale());
       document.getElementById("btnSample").addEventListener("click", fillSample);
       document.getElementById("btnGenerate").addEventListener("click", generateRandom);
       document.getElementById("btnReloadLog").addEventListener("click", loadLog);
@@ -170,6 +323,7 @@
         api.seed({}).then((r) => {
           C.toast("演示数据已生成：" + r.users + " 用户 / " + r.edges + " 边", "success");
           loadLog();
+          markStale();
         }).catch((e) => C.toast(e.message, "error"))
           .finally(() => { btn.disabled = false; btn.textContent = "生成完整演示数据"; });
       });

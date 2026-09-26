@@ -273,6 +273,102 @@ class GraphStore:
                 out.append((u, float(w)))
         return out
 
+    def canonical_edge_keys(self, shard_ids: Iterable[int]) -> Set[Tuple[int, int]]:
+        """Return the canonical (min, max) edge keys found in the given shards.
+
+        Edges are physically stored in exactly one endpoint's shard, so callers
+        pass the shards of *both* endpoints to answer "does this edge exist?"
+        without scanning all 64 shards.
+        """
+        keys: Set[Tuple[int, int]] = set()
+        for shard_id in {int(s) for s in shard_ids}:
+            data = _load_shard(shard_id)
+            for edge in data["edges"]:
+                u, v = int(edge[0]), int(edge[1])
+                if u != v:
+                    keys.add((u, v) if u < v else (v, u))
+        return keys
+
+    def shard_endpoint_nodes(self, shard_ids: Iterable[int]) -> Set[int]:
+        """All node ids incident to edges of the given shards."""
+        nodes: Set[int] = set()
+        for shard_id in {int(s) for s in shard_ids}:
+            data = _load_shard(shard_id)
+            for edge in data["edges"]:
+                nodes.add(int(edge[0]))
+                nodes.add(int(edge[1]))
+        return nodes
+
+    def shard_fingerprints(self, shard_ids: Iterable[int]) -> Dict[str, dict]:
+        """Cheap change-detection signatures for the given shards."""
+        out: Dict[str, dict] = {}
+        for shard_id in sorted({int(s) for s in shard_ids}):
+            path = _shard_path(shard_id)
+            data = _load_shard(shard_id)
+            try:
+                mtime_ns = os.stat(path).st_mtime_ns if os.path.exists(path) else 0
+            except OSError:
+                mtime_ns = 0
+            out[str(shard_id)] = {
+                "version": data.get("version", 1),
+                "edges": len(data["edges"]),
+                "mtime_ns": mtime_ns,
+            }
+        return out
+
+    def import_validated_edges(self, edges: Iterable[Tuple[int, int, float]]) -> dict:
+        """Write edges already classified as valid (unique, non-loop, existing users).
+
+        Same shard layout as :meth:`import_edges` but with defensive in-shard
+        deduplication: callers from the precheck pipeline guarantee uniqueness,
+        this re-check makes the count returned here trustworthy even under a
+        concurrent writer.  Shards are rewritten only when they actually change.
+        """
+        grouped: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        for u, v, w in edges:
+            u, v = int(u), int(v)
+            if u == v:
+                continue
+            a, b = (u, v) if u < v else (v, u)
+            grouped[_user_shard(a)].append((a, b, float(w)))
+
+        touched_shards: List[Tuple[int, int, int]] = []
+        written = 0
+        duplicates = 0
+        ts = config.now_ms()
+        for shard_id, new_edges in grouped.items():
+            data = _load_shard(shard_id)
+            existing: Set[Tuple[int, int]] = set()
+            for edge in data["edges"]:
+                eu, ev = int(edge[0]), int(edge[1])
+                if eu != ev:
+                    existing.add((eu, ev) if eu < ev else (ev, eu))
+            to_add = []
+            for a, b, w in new_edges:
+                if (a, b) in existing:
+                    duplicates += 1
+                    continue
+                existing.add((a, b))
+                to_add.append((a, b, w))
+            if not to_add:
+                continue
+            for a, b, w in to_add:
+                data["edges"].append([a, b, w, ts])
+                data["users"].setdefault(str(a), {"name": str(a)})
+                data["users"].setdefault(str(b), {"name": str(b)})
+            data["edges"].sort(key=lambda e: (e[0], e[1]))
+            _write_shard(shard_id, data)
+            written += len(to_add)
+            touched_shards.append((shard_id, len(data["users"]), len(data["edges"])))
+
+        if touched_shards:
+            self._refresh_index(touched_shards)
+        return {
+            "written": written,
+            "deduped_at_write": duplicates,
+            "touched_shards": len(touched_shards),
+        }
+
     # ---- incremental import ----------------------------------------------
     def import_edges(self, edges: Iterable[Tuple[int, int, float]]) -> dict:
         """Append edges to shards and refresh the index incrementally.

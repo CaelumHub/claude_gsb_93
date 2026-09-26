@@ -18,7 +18,10 @@ Endpoint summary (all under ``/api``):
     PUT    /api/users/<id>            {name?, tags?, attributes?}
     DELETE /api/users/<id>
     GET    /api/users/<id>/neighbors  ?depth
-    POST   /api/import                {edges:[[u,v],...], source}
+    POST   /api/import                {edges:[[u,v],...], source}  (legacy direct)
+    POST   /api/import/preview        {edges:[[u,v],...]} -> staged precheck
+    GET    /api/import/preview/<token>                         (reuse precheck)
+    POST   /api/import/commit         {token}                    (write after confirm)
     GET    /api/graph                 ?limit&community&top
     GET    /api/graph/neighborhood    ?node&depth&limit
     GET    /api/path                  ?source&target&algorithm
@@ -89,6 +92,23 @@ def _to_bool(value: Optional[str], default: bool = False) -> bool:
     if value is None:
         return default
     return value.lower() in ("1", "true", "yes", "on")
+
+
+def _normalise_edges(edges: list) -> tuple:
+    """Coerce request edges into ``(u, v, w)`` tuples; count malformed rows."""
+    normalised = []
+    malformed = 0
+    for e in edges:
+        if isinstance(e, (list, tuple)) and len(e) >= 2:
+            try:
+                normalised.append(
+                    (int(e[0]), int(e[1]), float(e[2]) if len(e) > 2 and e[2] is not None else 1.0)
+                )
+                continue
+            except (TypeError, ValueError):
+                pass
+        malformed += 1
+    return normalised, malformed
 
 
 class ApiRouter:
@@ -173,23 +193,45 @@ class ApiRouter:
             return 200, user
 
         # --- import ---
+        if route == "/import/preview" and method == "POST":
+            b = body or {}
+            edges = b.get("edges") or []
+            source = b.get("source", "manual")
+            if not isinstance(edges, list):
+                return _error("edges 必须是列表")
+            normalised, malformed = _normalise_edges(edges)
+            plan = self.service.plan_import(normalised, malformed=malformed, source=source)
+            return 200, plan
+
+        # --- fetch a previously staged precheck (result reuse) ---
+        m = re.fullmatch(r"/import/preview/(\w+)", route)
+        if m and method == "GET":
+            plan = self.service.get_staged_plan(m.group(1))
+            if plan is None:
+                return _error("预检记录不存在或已过期，请重新预检", 404)
+            return 200, plan
+
+        # --- commit a staged precheck ---
+        if route == "/import/commit" and method == "POST":
+            token = str((body or {}).get("token", ""))
+            if not token:
+                return _error("缺少预检 token")
+            try:
+                result = self.service.commit_import(token)
+            except KeyError as exc:
+                return _error(str(exc).strip("'\""), 404)
+            except ValueError as exc:
+                return _error(str(exc), 409)
+            return 200, result
+
         if route == "/import" and method == "POST":
             b = body or {}
             edges = b.get("edges") or []
             source = b.get("source", "manual")
             if not isinstance(edges, list):
                 return _error("edges 必须是列表")
-            normalised = []
-            for e in edges:
-                if isinstance(e, (list, tuple)) and len(e) >= 2:
-                    try:
-                        normalised.append((int(e[0]), int(e[1]), float(e[2]) if len(e) > 2 else 1.0))
-                    except (TypeError, ValueError):
-                        continue
-            result = self.service.store.import_edges(normalised)
-            result["imported"] = len(edges)
-            self.service.invalidate_graph()
-            storage.log_import({**result, "source": source, "time": config.now_ms()})
+            normalised, _malformed = _normalise_edges(edges)
+            result = self.service.import_edges_legacy(normalised, source=source)
             return 200, {**result, "source": source}
 
         # --- graph ---
