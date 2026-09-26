@@ -18,7 +18,10 @@ Endpoint summary (all under ``/api``):
     PUT    /api/users/<id>            {name?, tags?, attributes?}
     DELETE /api/users/<id>
     GET    /api/users/<id>/neighbors  ?depth
-    POST   /api/import                {edges:[[u,v],...], source}
+    POST   /api/import                {text|edges, source} -- pre-check + commit in one call
+    POST   /api/import/precheck       {text|edges, source} -> reusable preview ticket
+    GET    /api/import/preview/<id>   inspect a stored pre-check result
+    POST   /api/import/commit         {ticket} -- write exactly the pre-checked edges
     GET    /api/graph                 ?limit&community&top
     GET    /api/graph/neighborhood    ?node&depth&limit
     GET    /api/path                  ?source&target&algorithm
@@ -52,11 +55,13 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Optional
 
 try:
-    from . import config, storage
+    from . import config, importer
+    from .importer import PreviewMissing, PreviewStale
     from .service import SocialGraphService
 except ImportError:  # pragma: no cover
     import config
-    import storage
+    import importer
+    from importer import PreviewMissing, PreviewStale
     from service import SocialGraphService
 
 
@@ -172,25 +177,59 @@ class ApiRouter:
                 return _error("用户不存在", 404)
             return 200, user
 
-        # --- import ---
+        # --- import: pre-check -> preview -> commit (two-phase) -------------
+        def _parse_import_payload(b: dict):
+            """Accept raw ``text`` (server parses) or an ``edges`` array.
+
+            Returns ``(rows, invalid, source)`` on success or ``None`` on a
+            malformed request (caller then returns ``_parse_error``).
+            """
+            if not isinstance(b, dict):
+                return None
+            if isinstance(b.get("text"), str):
+                rows, invalid = importer.parse_edge_text(b["text"])
+            else:
+                edges = b.get("edges")
+                if not isinstance(edges, list):
+                    return None
+                rows, invalid = importer.rows_from_edges(edges)
+            return rows, invalid, str(b.get("source", "manual") or "manual")
+
+        if route == "/import/precheck" and method == "POST":
+            parsed = _parse_import_payload(body or {})
+            if parsed is None:
+                return _error("请求体需包含 text 文本或 edges 列表")
+            rows, invalid, source = parsed
+            if not rows and not invalid:
+                return _error("没有可预检的边，请先填写边列表")
+            return 200, self.service.precheck_edges(rows, invalid, source)
+
+        m = re.fullmatch(r"/import/preview/(\w+)", route)
+        if m and method == "GET":
+            try:
+                return 200, self.service.get_preview(m.group(1))
+            except PreviewMissing as exc:
+                return _error(str(exc), 404)
+
+        if route == "/import/commit" and method == "POST":
+            ticket_id = str((body or {}).get("ticket", "")).strip()
+            if not ticket_id:
+                return _error("缺少预检单号 ticket")
+            try:
+                return 200, self.service.commit_preview(ticket_id)
+            except PreviewMissing as exc:
+                return _error(str(exc), 404)
+            except PreviewStale as exc:
+                return _error(str(exc), 409)
+
         if route == "/import" and method == "POST":
-            b = body or {}
-            edges = b.get("edges") or []
-            source = b.get("source", "manual")
-            if not isinstance(edges, list):
-                return _error("edges 必须是列表")
-            normalised = []
-            for e in edges:
-                if isinstance(e, (list, tuple)) and len(e) >= 2:
-                    try:
-                        normalised.append((int(e[0]), int(e[1]), float(e[2]) if len(e) > 2 else 1.0))
-                    except (TypeError, ValueError):
-                        continue
-            result = self.service.store.import_edges(normalised)
-            result["imported"] = len(edges)
-            self.service.invalidate_graph()
-            storage.log_import({**result, "source": source, "time": config.now_ms()})
-            return 200, {**result, "source": source}
+            parsed = _parse_import_payload(body or {})
+            if parsed is None:
+                return _error("请求体需包含 text 文本或 edges 列表")
+            rows, invalid, source = parsed
+            if not rows and not invalid:
+                return _error("没有可导入的边")
+            return 200, self.service.import_edges_direct(rows, invalid, source)
 
         # --- graph ---
         if route == "/graph" and method == "GET":

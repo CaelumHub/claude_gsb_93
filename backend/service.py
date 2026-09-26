@@ -23,7 +23,7 @@ from collections import Counter, defaultdict
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
-    from . import algorithms, config, storage
+    from . import algorithms, config, importer, storage
     from .algorithms import (
         adamic_adar,
         bidirectional_shortest_path,
@@ -36,10 +36,12 @@ try:
         shortest_path,
     )
     from .graph import Graph
+    from .importer import PreviewMissing, PreviewStale
     from .storage import DerivedStore, GraphStore, rebuild_index_from_shards
 except ImportError:  # pragma: no cover
     import algorithms
     import config
+    import importer
     import storage
     from algorithms import (  # type: ignore
         adamic_adar,
@@ -53,6 +55,7 @@ except ImportError:  # pragma: no cover
         shortest_path,
     )
     from graph import Graph
+    from importer import PreviewMissing, PreviewStale
     from storage import DerivedStore, GraphStore, rebuild_index_from_shards
 
 
@@ -63,9 +66,13 @@ class SocialGraphService:
         self.store = GraphStore()
         self.derived = DerivedStore()
         self.settings = config.SettingsStore()
+        self.previews = importer.PreviewStore()
 
         # Caches (guarded by _lock).
         self._lock = threading.RLock()
+        # Serialises pre-check -> commit imports so two concurrent commits can
+        # never both pass the freshness check and double-write the same edges.
+        self._import_lock = threading.RLock()
         self._graph: Optional[Graph] = None
         self._graph_dirty = False
         self._community_cache: Optional[dict] = None
@@ -94,6 +101,139 @@ class SocialGraphService:
             self._graph_dirty = True
             self._community_dirty = False
             self._pagerank_dirty = True
+
+    # ------------------------------------------------------------------
+    # Edge-list import: pre-check (reusable ticket) then commit
+    # ------------------------------------------------------------------
+    def _import_snapshot(self) -> dict:
+        """Read-only view of registered users and existing edges.
+
+        The frozen graph is built once per request from the shards; the edge
+        set is normalised (``min, max``) because the graph is undirected while
+        shard rows may be stored under either orientation.
+        """
+        graph = self.get_graph()
+        users = set(self.store.load_users().keys())
+        edges = set()
+        for u, v, _w in graph.iter_edges():
+            edges.add((u, v) if u <= v else (v, u))
+        return {"users": users, "edges": edges, "nodes": set(graph.nodes)}
+
+    def precheck_edges(self, rows: list, invalid: list, source: str = "manual") -> dict:
+        """Run the classifier and persist a reusable preview ticket."""
+        with self._import_lock:
+            snapshot = self._import_snapshot()
+            fingerprint = importer.snapshot_fingerprint(snapshot["users"], snapshot["edges"])
+            report, accepted = importer.classify_edges(rows, invalid, snapshot)
+            ticket = self.previews.create(source, rows, invalid, report, fingerprint)
+        return {
+            "ticket": ticket["id"],
+            "source": source,
+            "created_at": ticket["created_at"],
+            "expires_at": ticket["expires_at"],
+            "fingerprint": fingerprint,
+            "accepted_count": len(accepted),
+            **report,
+        }
+
+    def get_preview(self, ticket_id: str) -> dict:
+        ticket = self.previews.get(ticket_id)
+        return {
+            "ticket": ticket["id"],
+            "source": ticket.get("source", "manual"),
+            "created_at": ticket["created_at"],
+            "expires_at": ticket["expires_at"],
+            "accepted_count": ticket["report"]["summary"]["accepted"],
+            **ticket["report"],
+        }
+
+    def commit_preview(self, ticket_id: str) -> dict:
+        """Write exactly the edges accepted by the ticket's pre-check.
+
+        The classifier is re-run against the *current* snapshot and the result
+        must match the stored fingerprint -- otherwise the graph/users moved
+        since the pre-check and the ticket is rejected instead of writing
+        against stale assumptions.
+        """
+        with self._import_lock:
+            ticket = self.previews.get(ticket_id)  # raises PreviewMissing if gone
+            snapshot = self._import_snapshot()
+            fingerprint = importer.snapshot_fingerprint(snapshot["users"], snapshot["edges"])
+            if fingerprint != ticket["fingerprint"]:
+                # Stale pre-check: keep the ticket so the user can inspect it,
+                # but force a fresh pre-check before writing.
+                raise PreviewStale("图数据在预检后已变化，请重新预检后再导入")
+
+            report, accepted = importer.classify_edges(
+                ticket["rows"], ticket.get("invalid", []), snapshot
+            )
+            result = self.store.import_edges_validated(
+                accepted, existing_keys=set(snapshot["edges"])
+            )
+            self.invalidate_graph()
+
+            entry = {
+                "ticket": ticket_id,
+                "source": ticket.get("source", "manual"),
+                "total_rows": report["summary"]["total_rows"],
+                "imported": result["imported"],
+                "duplicates": result["duplicates"],
+                "skipped": result["duplicates"],
+                "self_loops": result["self_loops"],
+                "invalid": report["summary"]["invalid"],
+                "missing_users": report["summary"]["missing_users"],
+                "touched_shards": result["touched_shards"],
+                "time": config.now_ms(),
+            }
+            storage.log_import(entry)
+            self.previews.delete(ticket_id)
+            return {
+                "ticket": ticket_id,
+                "source": entry["source"],
+                "report": report,
+                "result": result,
+                "imported": result["imported"],
+                "duplicates": result["duplicates"],
+                "skipped": result["duplicates"],
+                "self_loops": result["self_loops"],
+                "touched_shards": result["touched_shards"],
+            }
+
+    def import_edges_direct(self, rows: list, invalid: list, source: str = "manual") -> dict:
+        """Pre-check and immediately commit in one call (legacy POST /import).
+
+        Routing even this path through the classifier guarantees the reported
+        categories equal the rows actually written.
+        """
+        with self._import_lock:
+            snapshot = self._import_snapshot()
+            report, accepted = importer.classify_edges(rows, invalid, snapshot)
+            result = self.store.import_edges_validated(
+                accepted, existing_keys=set(snapshot["edges"])
+            )
+            self.invalidate_graph()
+            storage.log_import({
+                "source": source,
+                "total_rows": report["summary"]["total_rows"],
+                "imported": result["imported"],
+                "duplicates": result["duplicates"],
+                "skipped": result["duplicates"],
+                "self_loops": result["self_loops"],
+                "invalid": report["summary"]["invalid"],
+                "missing_users": report["summary"]["missing_users"],
+                "touched_shards": result["touched_shards"],
+                "time": config.now_ms(),
+            })
+            return {
+                "source": source,
+                "report": report,
+                "result": result,
+                "imported": result["imported"],
+                "duplicates": result["duplicates"],
+                "skipped": result["duplicates"],
+                "self_loops": result["self_loops"],
+                "touched_shards": result["touched_shards"],
+            }
 
     def graph_stats(self) -> dict:
         graph = self.get_graph()

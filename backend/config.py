@@ -43,6 +43,7 @@ PAGERANK_FILE = os.path.join(DATA_DIR, "pagerank.json")
 INDEX_FILE = os.path.join(DATA_DIR, "index.json")
 SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 IMPORT_LOG_FILE = os.path.join(DATA_DIR, "import_log.jsonl")
+IMPORT_PREVIEW_DIR = os.path.join(DATA_DIR, "import_preview")
 
 FRONTEND_DIR = os.path.join(ROOT_DIR, "frontend")
 

@@ -64,8 +64,11 @@
     deleteUser: (id) => request("DELETE", "/api/users/" + id),
     setUserTags: (id, tags) => request("POST", "/api/users/" + id + "/tags", { tags }),
 
-    // 关系导入
+    // 关系导入（预检 -> 预览 -> 确认写入，三段式）
     importEdges: (edges, source) => request("POST", "/api/import", { edges, source }),
+    precheckEdges: (payload) => request("POST", "/api/import/precheck", payload),
+    importPreview: (id) => request("GET", "/api/import/preview/" + encodeURIComponent(id)),
+    commitImport: (ticket) => request("POST", "/api/import/commit", { ticket }),
 
     // 图
     graph: (p) => request("GET", "/api/graph" + qs(p)),

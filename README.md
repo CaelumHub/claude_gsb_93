@@ -49,6 +49,7 @@ gsb3/
 │   ├── service.py              # 业务服务层（缓存、CRUD、算法调度）
 │   ├── api.py                  # HTTP 服务 + REST 路由 + 静态托管
 │   ├── seed.py                 # 演示数据生成器
+│   ├── importer.py             # 导入预检：解析、分类（重复/自环/不存在用户/孤立）、可复用预检单
 │   └── run.py                  # 入口（含 --check / --seed）
 ├── frontend/                   # 前端（10 页面 + 共享资源）
 │   ├── index.html              # 入口（跳转 graph.html）
@@ -73,6 +74,7 @@ gsb3/
     ├── community.json          # Louvain 结果缓存
     ├── pagerank.json           # PageRank 结果缓存
     ├── index.json              # 用户 → 分片 索引
+    ├── import_preview/         # 导入预检单（可复用，含图状态指纹，TTL 过期自动清理）
     └── settings.json           # 系统设置
 ```
 
@@ -98,7 +100,21 @@ gsb3/
 - **合并 / 索引重建**：`merge_shards()` 全量重写为规范形式（排序、去重），随后
   `rebuild_index_from_shards()` 重建唯一节点计数与分片映射。
 
-### 3. 算法（`algorithms.py`）
+### 3. 两阶段导入（预检 → 确认写入）
+
+- **预检**（`POST /api/import/precheck`）：后端统一解析边列表文本，对照当前图快照
+  （注册用户集合 + 已存在边集合）将每一行分类为 *可写入 / 重复边（图库已有或批次内重复）
+  / 自环 / 指向不存在用户 / 孤立节点风险 / 无法解析*，返回分类统计与明细预览；
+  预检不写任何数据，结果持久化为**可复用的预检单**（`data/import_preview/`，含图状态
+  SHA-256 指纹，TTL 过期自动清理，重启后仍可复查）。
+- **写入**（`POST /api/import/commit`）：提交预检单号即可。写入前用**同一个分类函数**
+  对当前快照复检并校验指纹——若预检后图数据发生变化则拒绝写入（409）并要求重新预检，
+  保证「确认后按预检结果执行、不产生数据错乱」；并发提交由导入锁串行化，预检单
+  一次性消费，杜绝重复写入。
+- 写入完成后返回**实际生效**与**去重跳过**数量；分片落盘时按规范化边键
+  `(min, max)` 与磁盘既有内容二次去重，统计与磁盘数据始终一致。
+
+### 4. 算法（`algorithms.py`）
 
 | 算法 | 实现要点 |
 | --- | --- |
@@ -110,7 +126,7 @@ gsb3/
 | 冷启动 | 好友数低于阈值时退化为「热门 + 标签重叠」 |
 | 多样性 | MMR 最大边际相关性重排序，λ 权衡相关性与多样性 |
 
-### 4. 数据分层
+### 5. 数据分层
 
 图数据（分片邻接表）与派生数据（`recommendations.json` / `profiles.json` /
 `community.json` / `pagerank.json`）**分开存储**：图变更只触发图分片的增量写与索引
@@ -128,7 +144,10 @@ gsb3/
 | GET/POST | `/api/users` | 用户列表（分页/搜索/标签过滤）/ 创建 |
 | GET/PUT/DELETE | `/api/users/<id>` | 用户详情 / 更新 / 删除 |
 | POST | `/api/users/<id>/tags` | 设置用户标签 |
-| POST | `/api/import` | 批量导入边 |
+| POST | `/api/import` | 批量导入边（内部同样走「预检分类 → 校验写入」单一代码路径） |
+| POST | `/api/import/precheck` | 边列表预检：识别重复边 / 自环 / 指向不存在用户的边 / 孤立节点风险，返回分类统计、明细预览与可复用的预检单 |
+| GET | `/api/import/preview/<id>` | 复查已存在的预检单（预检结果可复用，重启后仍有效） |
+| POST | `/api/import/commit` | 按预检单确认写入：图状态指纹校验通过后，仅写入预检通过的边，返回去重与生效数量 |
 | GET | `/api/graph` · `/api/graph/neighborhood` | 全图 / 邻域子图 |
 | GET | `/api/path` · `/api/common-friends` | 最短路径 / 共同好友 |
 | GET/POST | `/api/community` · `/api/community/compute` | Louvain 结果 / 重算 |

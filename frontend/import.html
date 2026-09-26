@@ -15,25 +15,24 @@
         <div class="page-head">
           <div>
             <h1>关系导入</h1>
-            <p class="desc">批量导入好友关系（边）。系统按用户分片存储，增量导入只触达受影响的分片，随后自动维护索引。</p>
+            <p class="desc">批量导入好友关系（边）。先预检识别重复边、自环、指向不存在用户的边与孤立节点风险，确认分类无误后再真正写入。</p>
           </div>
           <div class="actions">
             <button class="btn" id="btnSample">填充示例</button>
-            <button class="btn btn-primary" id="btnImport">⇄ 导入关系</button>
+            <button class="btn" id="btnPrecheck">🔍 预检</button>
+            <button class="btn btn-primary" id="btnCommit" disabled>✓ 确认写入</button>
           </div>
         </div>
 
         <div class="grid cols-3">
           <div class="card" style="grid-column: span 2">
             <div class="card-title">边列表</div>
-            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔。</p>
-            <textarea class="textarea mt-8" id="edgeInput" rows="12" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5"></textarea>
+            <p class="small muted mt-8">每行一条边，格式：<code>u v [权重]</code>，可用空格、逗号或制表符分隔；<code>#</code> 开头为注释。</p>
+            <textarea class="textarea mt-8" id="edgeInput" rows="14" placeholder="1 2&#10;2 3 0.8&#10;3,4&#10;1 5"></textarea>
+            <div class="small muted mt-8" id="parseHint"></div>
           </div>
           <div class="card">
-            <div class="card-title">导入结果</div>
-            <div id="importResult" class="mt-8 small muted">尚未导入。</div>
-            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
-            <div class="card-title" style="font-size:13px">生成随机关系</div>
+            <div class="card-title">生成关系数据</div>
             <div class="field-group mt-8">
               <label class="field">用户数</label>
               <input class="input" id="genNodes" type="number" value="50">
@@ -45,15 +44,30 @@
             <button class="btn" id="btnGenerate" style="width:100%">生成并填充</button>
             <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
             <button class="btn btn-primary" id="btnSeed" style="width:100%">生成完整演示数据</button>
+            <hr style="border:none;border-top:1px solid var(--border);margin:14px 0">
+            <div class="card-title" style="font-size:13px">当前图库概览</div>
+            <div id="importLog" class="small mt-8"></div>
           </div>
         </div>
 
-        <div class="card mt-16">
+        <!-- 预检结果 -->
+        <div class="card mt-16" id="precheckCard" style="display:none">
           <div class="card-head">
-            <div class="card-title">最近导入记录</div>
-            <button class="btn btn-sm" id="btnReloadLog">刷新</button>
+            <div class="card-title">预检结果 <span class="sub" id="ticketLabel"></span></div>
+            <div>
+              <button class="btn btn-sm" id="btnRefreshPreview">刷新预检单</button>
+              <button class="btn btn-sm" id="btnRecheck">重新预检</button>
+            </div>
           </div>
-          <div id="importLog" class="small"></div>
+          <div id="precheckBody"></div>
+        </div>
+
+        <!-- 写入结果 -->
+        <div class="card mt-16" id="commitCard" style="display:none">
+          <div class="card-head">
+            <div class="card-title">写入结果</div>
+          </div>
+          <div id="commitBody" class="small"></div>
         </div>
       </section>
     </main>
@@ -64,56 +78,242 @@
   <script>
     const C = common;
 
-    function parseEdges(text) {
-      const edges = [];
-      const lines = text.split(/\r?\n/);
-      for (const line of lines) {
-        const t = line.trim();
-        if (!t || t.startsWith("#")) continue;
-        const parts = t.split(/[\s,;\t]+/).filter(Boolean);
-        if (parts.length < 2) continue;
-        const u = parseInt(parts[0], 10);
-        const v = parseInt(parts[1], 10);
-        if (isNaN(u) || isNaN(v)) continue;
-        let w = 1.0;
-        if (parts.length >= 3 && !isNaN(parseFloat(parts[2]))) w = parseFloat(parts[2]);
-        edges.push([u, v, w]);
-      }
-      return edges;
+    // 当前预检单状态
+    const state = {
+      ticket: null,          // 预检单号
+      textAtPrecheck: "",    // 预检时的文本（用于检测改动）
+      stale: false,          // 预检后数据是否已变化
+      report: null,          // 最近一次预检报告
+    };
+
+    const REASON_LABELS = {
+      self_loop: "自环",
+      missing_user: "用户不存在",
+      duplicate_existing: "与已有边重复",
+      duplicate_batch: "批次内重复",
+      isolated: "孤立节点风险",
+    };
+
+    function reasonBadges(reasons) {
+      return (reasons || [])
+        .map((r) => '<span class="badge danger" style="margin-right:4px">' +
+          C.escapeHtml(REASON_LABELS[r] || r) + "</span>")
+        .join("");
     }
 
-    function doImport(edges, source) {
-      if (!edges.length) { C.toast("没有可导入的边", "warning"); return; }
-      const btn = document.getElementById("btnImport");
-      btn.disabled = true; btn.textContent = "导入中…";
-      api.importEdges(edges, source)
+    function edgeCell(item) {
+      return '<span style="font-family:var(--mono)">' +
+        item.u + " → " + item.v + ' <span class="muted">w=' + item.w + "</span></span>";
+    }
+
+    // 仅在浏览器端粗略数行，真正解析以后端为准。
+    function refreshParseHint() {
+      const text = document.getElementById("edgeInput").value;
+      const lines = text.split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l && !l.startsWith("#")).length;
+      document.getElementById("parseHint").textContent =
+        lines ? "约 " + lines + " 个数据行（点击「预检」由后端精确分类）" : "";
+      if (state.ticket && text !== state.textAtPrecheck) markStale("边列表已修改");
+    }
+
+    function markStale(reason) {
+      if (state.stale) return;
+      state.stale = true;
+      const btn = document.getElementById("btnCommit");
+      btn.disabled = true;
+      const box = document.getElementById("precheckBody");
+      const banner = document.createElement("div");
+      banner.className = "badge warning";
+      banner.style.cssText = "display:block;margin-bottom:12px;padding:10px 12px";
+      banner.textContent = "⚠ " + reason + "，该预检结果已不能用于写入，请重新预检。";
+      box.prepend(banner);
+    }
+
+    // ------------------------------------------------------------------
+    // 预检报告渲染
+    // ------------------------------------------------------------------
+    function statTile(label, value, cls, hint) {
+      return '<div class="card stat-tile" style="padding:14px">' +
+        '<div class="label">' + label + "</div>" +
+        '<div class="value ' + (cls || "") + '">' + value + "</div>" +
+        (hint ? '<div class="hint">' + hint + "</div>" : "") +
+        "</div>";
+    }
+
+    function detailSection(key, title, badgeCls, renderRow, body) {
+      const sec = body.details[key];
+      if (!sec || sec.total === 0) return "";
+      let html = '<div class="card mt-16" style="box-shadow:none;border:1px solid var(--border)">' +
+        '<div class="card-head"><div class="card-title" style="font-size:14px">' +
+        '<span class="badge ' + badgeCls + '">' + sec.total + "</span> " + title +
+        "</div>";
+      if (sec.has_more) {
+        html += '<span class="small muted">明细较大，仅预览前 ' + sec.items.length + " 条</span>";
+      }
+      html += "</div><div class='table-wrap'><table class='table'><thead><tr>" +
+        "<th style='width:70px'>行号</th><th>边</th><th>说明</th></tr></thead><tbody>";
+      for (const item of sec.items) {
+        html += "<tr><td class='num'>" + item.line + "</td><td>" + edgeCell(item) +
+          "</td><td>" + renderRow(item) + "</td></tr>";
+      }
+      html += "</tbody></table></div></div>";
+      return html;
+    }
+
+    function renderReport(report) {
+      const s = report.summary;
+      const card = document.getElementById("precheckCard");
+      card.style.display = "";
+      document.getElementById("ticketLabel").textContent =
+        state.ticket ? "（预检单 " + state.ticket + "）" : "";
+
+      let html = '<div class="grid cols-4">';
+      html += statTile("数据行总数", s.total_rows, "", "可解析 " + s.parsed + " 行");
+      html += statTile("可写入", s.accepted, s.accepted ? "trend-up" : "trend-down",
+        "确认后将真正生效的边");
+      html += statTile("重复边", s.duplicates, s.duplicates ? "trend-down" : "",
+        "已有 " + s.duplicate_existing + " · 批次内 " + s.duplicate_batch);
+      html += statTile("自环", s.self_loops, s.self_loops ? "trend-down" : "",
+        "u = v，写入时忽略");
+      html += statTile("用户不存在", s.missing_users, s.missing_users ? "trend-down" : "",
+        "端点未在用户档案中登记");
+      html += statTile("孤立风险", s.isolated_rows, s.isolated_rows ? "trend-down" : "",
+        "涉及 " + s.isolated_nodes + " 个可能孤立的节点");
+      html += statTile("无法解析", s.invalid, s.invalid ? "trend-down" : "",
+        "格式错误的数据行");
+      html += "</div>";
+
+      html += '<p class="small muted mt-8">预检<b>不会写入任何数据</b>。' +
+        "一条边可能同时命中多个分类；确认写入时只会写入「可写入」的边，其余分类按预检结果跳过。</p>";
+
+      html += detailSection("accepted", "可写入明细预览", "success",
+        (it) => '<span class="badge success">将生效</span>', { details: report.details });
+      html += detailSection("duplicates", "重复边明细", "warning",
+        (it) => reasonBadges(it.reasons), { details: report.details });
+      html += detailSection("self_loops", "自环明细", "danger",
+        () => '<span class="badge danger">自环将被忽略</span>', { details: report.details });
+      html += detailSection("missing_users", "指向不存在用户的边", "danger",
+        (it) => reasonBadges(it.reasons) +
+          '<span class="small muted">缺失端点：' +
+          (it.missing || []).join(", ") + "</span>", { details: report.details });
+      html += detailSection("isolated", "会导致孤立节点的边", "warning",
+        (it) => reasonBadges(it.reasons) +
+          '<span class="small muted">孤立端点：' +
+          (it.endpoints || []).join(", ") + "</span>", { details: report.details });
+      html += detailSection("invalid", "无法解析的数据行", "danger",
+        (it) => '<span class="badge danger">' + C.escapeHtml(it.reason) + "</span>" +
+          '<div class="small muted" style="font-family:var(--mono)">' +
+          C.escapeHtml(it.raw) + "</div>", { details: report.details });
+
+      document.getElementById("precheckBody").innerHTML = html;
+
+      const btn = document.getElementById("btnCommit");
+      btn.disabled = state.stale || s.accepted === 0;
+      btn.textContent = s.accepted === 0
+        ? "✓ 确认写入（无可写入边）"
+        : "✓ 确认写入（" + s.accepted + " 条）";
+    }
+
+    // ------------------------------------------------------------------
+    // 操作
+    // ------------------------------------------------------------------
+    function setBusy(btnId, text, busyText) {
+      const btn = document.getElementById(btnId);
+      btn.disabled = true;
+      btn._oldText = btn.textContent;
+      btn.textContent = busyText;
+      return () => { btn.disabled = false; btn.textContent = text || btn._oldText; };
+    }
+
+    function runPrecheck() {
+      const text = document.getElementById("edgeInput").value;
+      if (!text.trim()) { C.toast("请先填写边列表", "warning"); return; }
+      const done = setBusy("btnPrecheck", null, "预检中…");
+      api.precheckEdges({ text, source: "manual" })
         .then((r) => {
-          const box = document.getElementById("importResult");
-          box.innerHTML =
-            '<div class="badge success">成功</div>' +
-            '<div class="mt-8">导入 <strong>' + r.imported + "</strong> 条边</div>" +
-            '<div class="mt-8">跳过重复 <strong>' + r.skipped + "</strong> 条</div>" +
-            '<div class="mt-8">自环忽略 <strong>' + r.self_loops + "</strong> 条</div>" +
-            '<div class="mt-8">触达分片 <strong>' + r.touched_shards + "</strong> 个</div>";
-          C.toast("已导入 " + r.imported + " 条关系", "success");
-          loadLog();
+          state.ticket = r.ticket;
+          state.textAtPrecheck = text;
+          state.stale = false;
+          state.report = r;
+          document.getElementById("commitCard").style.display = "none";
+          renderReport(r);
+          C.toast("预检完成：可写入 " + r.summary.accepted + " 条，异常 " +
+            (r.summary.total_rows - r.summary.accepted) + " 条", "info");
         })
         .catch((e) => C.toast(e.message, "error"))
-        .finally(() => { btn.disabled = false; btn.textContent = "⇄ 导入关系"; });
+        .finally(done);
     }
 
-    function loadLog() {
+    async function runCommit() {
+      if (!state.ticket || state.stale) { C.toast("请先完成预检", "warning"); return; }
+      const ok = await C.confirmDialog(
+        "将按预检结果写入 " + state.report.summary.accepted +
+        " 条边，重复边 / 自环 / 用户不存在的边会被跳过。确认继续？"
+      );
+      if (!ok) return;
+      const btn = document.getElementById("btnCommit");
+      const old = btn.textContent;
+      btn.disabled = true; btn.textContent = "写入中…";
+      api.commitImport(state.ticket)
+        .then((r) => {
+          state.ticket = null;
+          state.stale = true;
+          renderCommitResult(r);
+          C.toast("写入完成：生效 " + r.imported + " 条，去重跳过 " +
+            r.duplicates + " 条", "success");
+          loadOverview();
+        })
+        .catch((e) => {
+          btn.disabled = false; btn.textContent = old;
+          if (e.message.indexOf("重新预检") !== -1) markStale("图数据在预检后发生变化");
+          C.toast(e.message, "error");
+        });
+    }
+
+    function renderCommitResult(r) {
+      const card = document.getElementById("commitCard");
+      card.style.display = "";
+      const s = r.report.summary;
+      const html =
+        '<div class="badge success">写入成功</div>' +
+        '<div class="grid cols-4 mt-8">' +
+        statTile("实际生效", r.imported, "trend-up", "去重后真正新增的边") +
+        statTile("去重跳过", r.duplicates, "", "与图库或批次内重复") +
+        statTile("自环忽略", r.self_loops, "", "") +
+        statTile("触达分片", r.touched_shards, "", "本次写入涉及的分片数") +
+        "</div>" +
+        '<p class="small muted mt-8">预检共 ' + s.total_rows + " 行：可写入 " +
+        s.accepted + "、重复 " + s.duplicates + "、自环 " + s.self_loops +
+        "、用户不存在 " + s.missing_users + "、无法解析 " + s.invalid +
+        "。预检单已使用并失效。</p>";
+      document.getElementById("commitBody").innerHTML = html;
+      const btn = document.getElementById("btnCommit");
+      btn.disabled = true;
+      btn.textContent = "✓ 确认写入";
+    }
+
+    function refreshPreview() {
+      if (!state.ticket) return;
+      api.importPreview(state.ticket)
+        .then((r) => { state.report = r; renderReport(r); })
+        .catch((e) => {
+          if (e.message.indexOf("预检单") !== -1) markStale(e.message);
+          C.toast(e.message, "error");
+        });
+    }
+
+    function loadOverview() {
       const box = document.getElementById("importLog");
-      // 后端不直接提供日志读取，这里用 stats 的 shard 信息给出概览。
       api.stats().then((s) => {
         const shards = s.shards || [];
         const totalEdges = shards.reduce((a, b) => a + b.edges, 0);
-        const totalUsers = shards.reduce((a, b) => a + b.users, 0);
         box.innerHTML =
           '<div class="row wrap">' +
           '<span class="badge info">分片 ' + shards.length + "</span>" +
-          '<span class="badge brand">边 ' + totalEdges + "</span>" +
-          '<span class="badge">节点 ' + s.graph.nodes + "</span>" +
+          '<span class="badge brand">分片边记录 ' + totalEdges + "</span>" +
+          '<span class="badge">图节点 ' + s.graph.nodes + "</span>" +
+          '<span class="badge success">图边 ' + s.graph.edges + "</span>" +
           "</div>";
       }).catch(() => { box.innerHTML = '<span class="faint">加载失败</span>'; });
     }
@@ -129,6 +329,7 @@
         }
       }
       document.getElementById("edgeInput").value = lines.join("\n");
+      refreshParseHint();
     }
 
     function generateRandom() {
@@ -143,7 +344,8 @@
         }
       }
       document.getElementById("edgeInput").value = lines.join("\n");
-      C.toast("已生成 " + lines.length + " 条随机边", "success");
+      refreshParseHint();
+      C.toast("已生成 " + lines.length + " 条随机边，点击「预检」检查", "success");
     }
 
     // 确定性伪随机数（Mulberry32）
@@ -158,23 +360,24 @@
     }
 
     C.initPage("import", function () {
-      document.getElementById("btnImport").addEventListener("click", () => {
-        doImport(parseEdges(document.getElementById("edgeInput").value), "manual");
-      });
+      document.getElementById("btnPrecheck").addEventListener("click", runPrecheck);
+      document.getElementById("btnCommit").addEventListener("click", runCommit);
+      document.getElementById("btnRecheck").addEventListener("click", runPrecheck);
+      document.getElementById("btnRefreshPreview").addEventListener("click", refreshPreview);
+      document.getElementById("edgeInput").addEventListener("input", refreshParseHint);
       document.getElementById("btnSample").addEventListener("click", fillSample);
       document.getElementById("btnGenerate").addEventListener("click", generateRandom);
-      document.getElementById("btnReloadLog").addEventListener("click", loadLog);
       document.getElementById("btnSeed").addEventListener("click", () => {
         const btn = document.getElementById("btnSeed");
         btn.disabled = true; btn.textContent = "生成中…";
         api.seed({}).then((r) => {
           C.toast("演示数据已生成：" + r.users + " 用户 / " + r.edges + " 边", "success");
-          loadLog();
+          loadOverview();
         }).catch((e) => C.toast(e.message, "error"))
           .finally(() => { btn.disabled = false; btn.textContent = "生成完整演示数据"; });
       });
       fillSample();
-      loadLog();
+      loadOverview();
     });
   </script>
 </body>

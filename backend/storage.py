@@ -315,6 +315,72 @@ class GraphStore:
             "touched_shards": len(touched_shards),
         }
 
+    def import_edges_validated(
+        self,
+        rows: List[dict],
+        existing_keys: Optional[Set[Tuple[int, int]]] = None,
+    ) -> dict:
+        """Import rows already accepted by the pre-check classifier.
+
+        Unlike :meth:`import_edges` (the legacy raw append path), this method
+        performs a *real* merge against the shard contents, so edges that
+        already exist on disk -- including edges stored under the opposite
+        orientation -- are counted as duplicates instead of being written a
+        second time.  ``existing_keys`` may be supplied from the commit
+        snapshot to avoid rescanning every touched shard; either way the shard
+        merge itself remains the authoritative dedup guard, which keeps the
+        final counts exactly consistent with the data on disk.
+
+        Returns ``{imported, duplicates, self_loops, touched_shards}`` where
+        ``imported`` is the number of *new* edges that took effect.
+        """
+        existing_keys = set(existing_keys or ())
+        pending: Dict[int, List[Tuple[int, int, float]]] = defaultdict(list)
+        self_loops = 0
+        duplicates = 0
+        for row in rows:
+            u, v, w = int(row["u"]), int(row["v"]), float(row.get("w", 1.0))
+            if u == v:  # pre-check already rejects these; defensive only
+                self_loops += 1
+                continue
+            key = (u, v) if u <= v else (v, u)
+            if key in existing_keys:
+                duplicates += 1
+                continue
+            existing_keys.add(key)  # later repeats inside the batch
+            pending[_user_shard(u)].append((u, v, w))
+
+        touched_shards: List[Tuple[int, int, int]] = []
+        imported = 0
+        ts = config.now_ms()
+        for shard_id, new_edges in pending.items():
+            data = _load_shard(shard_id)
+            # Canonical dedup key for everything already on this shard.
+            on_disk = {(min(int(e[0]), int(e[1])), max(int(e[0]), int(e[1])))
+                       for e in data["edges"]}
+            for u, v, w in new_edges:
+                key = (u, v) if u <= v else (v, u)
+                if key in on_disk:
+                    duplicates += 1
+                    continue
+                on_disk.add(key)
+                data["edges"].append([u, v, w, ts])
+                data["users"].setdefault(str(u), {"name": str(u)})
+                data["users"].setdefault(str(v), {"name": str(v)})
+                imported += 1
+            if new_edges:
+                data["edges"].sort(key=lambda e: (e[0], e[1]))
+                _write_shard(shard_id, data)
+            touched_shards.append((shard_id, len(data["users"]), len(data["edges"])))
+
+        self._refresh_index(touched_shards)
+        return {
+            "imported": imported,
+            "duplicates": duplicates,
+            "self_loops": self_loops,
+            "touched_shards": len(touched_shards),
+        }
+
     def _refresh_index(self, shard_stats: List[Tuple[int, int, int]]) -> None:
         for shard_id, node_count, edge_count in shard_stats:
             data = _load_shard(shard_id)

@@ -31,7 +31,7 @@ else:
 
 def _check() -> int:
     """Run a smoke test over the algorithm stack; exit 0 on success."""
-    from backend import algorithms
+    from backend import algorithms, importer
     from backend.graph import Graph
 
     g = Graph(directed=False)
@@ -57,7 +57,40 @@ def _check() -> int:
     rec = algorithms.hybrid_recommend(g, 1, k=3)
     assert "items" in rec
 
-    print("[check] OK: graph, bfs, pagerank, louvain, recommend all pass")
+    # --- import pre-check classification (must match what commit would do) ---
+    existing = {(min(u, v), max(u, v)) for u, v in edges}
+    snapshot = {"users": {1, 2, 3, 4, 5, 6}, "edges": existing, "nodes": {1, 2, 3, 4, 5, 6}}
+    text = "\n".join([
+        "1 2",          # already in the graph -> duplicate_existing
+        "7 8",          # both users missing; both would be isolated
+        "9 9",          # self loop on an unregistered user -> isolated too
+        "3 4 0.5",      # duplicate (weight ignored)
+        "4 7",          # 7 missing & would stay isolated; 4 already connected
+        "3 5",          # accepted
+        "3 5",          # second occurrence -> duplicate_batch
+        "a b",          # invalid
+        "10 -3",        # invalid (negative id)
+    ])
+    rows, invalid = importer.parse_edge_text(text)
+    assert len(rows) == 7 and len(invalid) == 2, (len(rows), len(invalid))
+    report, accepted = importer.classify_edges(rows, invalid, snapshot)
+    s = report["summary"]
+    assert s["total_rows"] == 9, s
+    assert s["accepted"] == 1, s
+    assert len(accepted) == 1 and (accepted[0]["u"], accepted[0]["v"]) == (3, 5)
+    assert s["duplicates"] == 3 and s["duplicate_existing"] == 2 and s["duplicate_batch"] == 1, s
+    assert s["self_loops"] == 1, s
+    assert s["missing_users"] == 3, s          # 7-8, 9-9, 4-7
+    assert s["isolated_rows"] == 3 and s["isolated_nodes"] == 3, s  # {7, 8, 9}
+    assert s["invalid"] == 2, s
+
+    # Fingerprint must be order-independent over the same normalised inputs.
+    f1 = importer.snapshot_fingerprint(snapshot["users"], snapshot["edges"])
+    f2 = importer.snapshot_fingerprint({6, 5, 4, 3, 2, 1}, set(snapshot["edges"]))
+    assert f1 == f2, (f1, f2)
+    assert importer.snapshot_fingerprint(snapshot["users"], snapshot["edges"] | {(1, 6)}) != f1
+
+    print("[check] OK: graph, bfs, pagerank, louvain, recommend, import-precheck all pass")
     return 0
 
 
